@@ -38,9 +38,29 @@ information. `pokertui` solves that in the client:
 
 Honest limits: the host can stack the deck *before* committing (that needs mental
 poker to fix), there is no host migration, and public brokers are best-effort and
-not meant for production traffic. Play with friends, not for money.
+not meant for production traffic. Play with people you trust: the host deals.
 
-## Quick start
+## Install
+
+```bash
+cargo install --git https://github.com/ICYBAWSS/pokertui --locked
+poker
+```
+
+That's it: `poker` opens the menu. **Host** picks a game type, **Join** asks for the
+code your friend shares.
+
+| game type | blinds | stacks | seats | clock |
+|---|---|---|---|---|
+| Quick Game | 25/50 | 5,000 | 6 | 30 s |
+| High Roller | 500/1,000 | 100,000 | 6 | 45 s |
+| Turbo | 50/100 | 3,000 | 6 | 15 s |
+| Heads-Up | 50/100 | 5,000 | 2 | 30 s |
+| Custom | you choose starting stack, both blinds, seats (2–9), timer, auto top-up | | | |
+
+Press `E` on any preset to tweak it first; your last custom settings are remembered.
+
+## Quick start (from a clone)
 
 ```bash
 cargo build --release
@@ -51,7 +71,9 @@ cargo build --release
 ./target/release/poker join  K7Q2-9XZP --name bob
 ./target/release/poker spectate K7Q2-9XZP
 
-./target/release/poker verify ~/.local/share/pokertui/history/<room>/hand-0001.json
+# hand history: ~/Library/Application Support/dev.pokertui.pokertui/history (macOS)
+#               ~/.local/share/pokertui/history (Linux)
+./target/release/poker verify <history-dir>/<room>/hand-0001.json
 ./target/release/poker replay  <same file>
 ./target/release/poker art                  # print the embedded lobby splash
 ```
@@ -61,15 +83,22 @@ Terminal size: 60×18 minimum, 100×30+ looks best. `--no-art` disables the spla
 
 ### Controls
 
+Menus: arrow keys + Enter, or press the number shown. At the table:
+
 | key | action |
 |---|---|
-| `f` / `c` / `x` | fold / call / check |
-| `r 300` | raise to 300 |
-| `a` | all-in |
-| `/text` | chat |
-| `s` | deal the next hand (host) |
+| `1` | fold |
+| `2` | check, or call the bet |
+| `3` | raise box: `M` min · `H` ½ pot · `P` pot · `A` max · ←→ ± big blind · or type an amount, then Enter |
+| `4` | all-in |
+| `Enter` | deal the next hand (host) |
+| `t` | chat |
 | `?` | help |
+| `Esc` | leave the table (back to the menu; the host leaving closes the table) |
 | `^C` | quit |
+
+Letter keys `f` / `c` / `x` / `r` / `a` also work. TUI logs go to `poker.log` in the
+same app-data folder as the hand history.
 
 ## How it works
 
@@ -157,7 +186,8 @@ cropped and embedded with `include_str!`. Regenerate with `scripts/gen-art.sh`.
 
 - [ ] host migration / reclaimable seats
 - [ ] session key persistence per room (reconnect as the same player)
-- [ ] TestBackend UI snapshots and an offline fake-relay integration test
+- [ ] host kick / ban
+- [ ] offline fake-relay integration test
 - [ ] optional Cloudflare Durable Objects relay (free tier: 100k req/day)
 - [ ] mental-poker shuffles, tournaments, delayed spectating
 
