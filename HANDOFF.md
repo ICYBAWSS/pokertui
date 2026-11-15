@@ -34,8 +34,14 @@ cargo build --release            # binary: target/release/poker
 ./target/release/poker --broker wss://test.mosquitto.org:8081/mqtt host
 ```
 
-Keys inside the TUI: `f` fold · `c` call · `x` check · `r <amount>` raise · `a` all-in ·
-`/text` chat · `?` help · `s` deal next hand (host) · `^C` quit.
+Just run `poker`: splash → name (first run) → **Host** (pick Quick Game / High Roller /
+Turbo / Heads-Up / Custom table settings) or **Join** (type the 8-char code). The
+subcommands above still skip the menu.
+
+Keys at the table: `1` fold · `2` check/call · `3` raise box (`M` min, `H` ½ pot, `P` pot,
+`A` max, ←→ ±BB, or type an amount) · `4` all-in · `Enter` deal (host) · `t` chat ·
+`?` help · `Esc` leave (back to the menu). TUI logs go to
+`~/Library/Application Support/dev.pokertui.pokertui/poker.log`.
 
 Tests:
 
@@ -149,7 +155,9 @@ Cargo.toml                ratatui 0.30, rumqttc 0.25 (websocket), tokio, clap 4.
                           ed25519-dalek 3, x25519-dalek 3, chacha20poly1305 0.11,
                           hkdf 0.13, sha2 0.11, rand_chacha 0.10, base64, directories 6
 src/main.rs               clap CLI, runtime wiring, TUI loop, plain mode, verify/replay
-src/app.rs                UI state machine, key/command parsing, event application
+src/app.rs                table UI state, key handling, raise picker, animation timestamps
+src/menu.rs               splash/name/main/game-type/settings/code screens + presets
+src/anim.rs               easing, shimmer, pulse, deterministic fireworks
 src/ui.rs                 table/oval seats/cards/action bar/log/help/notice/celebration
 src/art.rs                include_str! of assets/art/*, centering/clipping
 src/crypto.rs             ed25519 identity, sealed boxes, deck commit, base64 helpers

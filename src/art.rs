@@ -8,6 +8,15 @@
 pub const LOBBY: &str = include_str!("../assets/art/lobby.txt");
 pub const WIN: &str = include_str!("../assets/art/win.txt");
 
+/// Title wordmark for the splash and menus (41×6).
+pub const WORDMARK: &str = "\
+██████╗  ██████╗ ██╗  ██╗███████╗██████╗
+██╔══██╗██╔═══██╗██║ ██╔╝██╔════╝██╔══██╗
+██████╔╝██║   ██║█████╔╝ █████╗  ██████╔╝
+██╔═══╝ ██║   ██║██╔═██╗ ██╔══╝  ██╔══██╗
+██║     ╚██████╔╝██║  ██╗███████╗██║  ██║
+╚═╝      ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝";
+
 /// Trimmed lines of the art.
 pub fn lines(art: &str) -> Vec<&str> {
     let mut out: Vec<&str> = art.lines().map(|l| l.trim_end()).collect();

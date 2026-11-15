@@ -84,7 +84,13 @@ pub async fn run_host(
         }
     }
 
-    // Clear the retained snapshot so the table does not appear alive after exit.
+    // Tell everyone, then clear the retained snapshot so the table does not
+    // appear alive after exit.
+    if let Ok(env) = host.envelope(Payload::Closed { reason: "the host closed the table".into() })
+        && let Ok(bytes) = env.to_bytes()
+    {
+        let _ = link.publish(&host.topics.events(), bytes, false).await;
+    }
     let _ = link.publish(&snapshot_topic, Vec::new(), true).await;
     let _ = tx.send(UiEvent::Closed("table closed".into()));
     Ok(())
@@ -120,7 +126,7 @@ impl Host {
         )?;
         self.host_seat = seat;
         self.table.set_ready(seat, true);
-        self.table.set_message("waiting for players · press s to deal");
+        self.table.set_message("waiting for players");
         self.last_seen[seat] = Some(Instant::now());
 
         let _ = self.tx.send(UiEvent::Connected {

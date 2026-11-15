@@ -37,6 +37,42 @@ pub struct LogLine {
     pub kind: LogKind,
 }
 
+/// The raise-amount overlay.
+#[derive(Clone, Debug, Default)]
+pub struct RaisePicker {
+    pub amount: u64,
+    /// Digits typed so far (None = using presets / arrows).
+    pub typed: Option<String>,
+}
+
+/// Timestamps that drive the table animations; see `ui`.
+#[derive(Clone, Debug, Default)]
+pub struct Anim {
+    pub deal_at: Option<Instant>,
+    pub board_from: usize,
+    pub board_at: Option<Instant>,
+    pub pot_from: u64,
+    pub pot_at: Option<Instant>,
+    pub chips_from: Vec<usize>,
+    pub chips_at: Option<Instant>,
+    pub deadline: u64,
+    pub deadline_total: u64,
+    pub result_at: Option<Instant>,
+}
+
+pub const DEAL_MS: u64 = 550;
+pub const FLIP_MS: u64 = 260;
+pub const FLIP_STAGGER_MS: u64 = 140;
+pub const POT_MS: u64 = 500;
+pub const CHIPS_MS: u64 = 420;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub struct App {
     pub mode: Mode,
     pub code: String,
@@ -59,6 +95,13 @@ pub struct App {
     pub net: UnboundedSender<NetCommand>,
     pub started: Instant,
     pub tick: u64,
+    /// Go back to the menu (table closed or player left).
+    pub leave: bool,
+    /// Why the table closed, shown on the menu.
+    pub closed: Option<String>,
+    pub confirm_leave: bool,
+    pub raise: Option<RaisePicker>,
+    pub anim: Anim,
 }
 
 impl App {
@@ -91,6 +134,11 @@ impl App {
             net,
             started: Instant::now(),
             tick: 0,
+            leave: false,
+            closed: None,
+            confirm_leave: false,
+            raise: None,
+            anim: Anim::default(),
         }
     }
 
@@ -140,8 +188,10 @@ impl App {
                 self.set_notice(text);
             }
             UiEvent::Closed(reason) => {
-                self.push_log(LogKind::Info, reason);
-                self.quit = true;
+                self.push_log(LogKind::Info, reason.clone());
+                // The first reason is the real one; later ones are shutdown noise.
+                self.closed.get_or_insert(reason);
+                self.leave = true;
             }
         }
     }
@@ -161,7 +211,92 @@ impl App {
         if view.phase == Phase::Lobby {
             self.my_cards.clear();
         }
+        self.note_animations(&view);
         self.view = Some(view);
+    }
+
+    /// Compare the incoming view with the current one and start animations.
+    fn note_animations(&mut self, new: &TableView) {
+        let now = Instant::now();
+        let shown_pot = self.pot_shown();
+        let a = &mut self.anim;
+        let Some(old) = &self.view else {
+            // First view (e.g. joining mid-hand): show it as is.
+            a.board_from = new.board.len();
+            a.pot_from = new.pot;
+            return;
+        };
+        let new_hand = old.hand_no != new.hand_no;
+        if new.phase == Phase::Betting && (new_hand || old.phase != Phase::Betting) {
+            a.deal_at = Some(now);
+            a.board_from = 0;
+            a.board_at = None;
+        }
+        if !new_hand && new.board.len() > old.board.len() {
+            a.board_from = old.board.len();
+            a.board_at = Some(now);
+        } else if new.board.len() < a.board_from {
+            a.board_from = new.board.len();
+        }
+        if new.pot != old.pot {
+            a.pot_from = if new_hand { 0 } else { shown_pot };
+            a.pot_at = Some(now);
+        }
+        if !new_hand && new.pot > old.pot {
+            let swept: Vec<usize> = old
+                .seats
+                .iter()
+                .filter(|s| s.bet > 0 && new.seats.get(s.seat).is_some_and(|n| n.bet == 0))
+                .map(|s| s.seat)
+                .collect();
+            if !swept.is_empty() {
+                a.chips_from = swept;
+                a.chips_at = Some(now);
+            }
+        }
+        if new.deadline_ms != a.deadline {
+            a.deadline = new.deadline_ms;
+            a.deadline_total = new.deadline_ms.saturating_sub(now_ms());
+        }
+    }
+
+    /// Pot as currently displayed (counts up after a change).
+    pub fn pot_shown(&self) -> u64 {
+        let Some(view) = &self.view else { return 0 };
+        match self.anim.pot_at {
+            Some(at) => {
+                let t = crate::anim::ease_out(crate::anim::progress(at, Duration::from_millis(POT_MS)));
+                crate::anim::lerp_u64(self.anim.pot_from, view.pot, t)
+            }
+            None => view.pot,
+        }
+    }
+
+    /// Fraction of the turn clock left, if a clock is running.
+    pub fn timer_fraction(&self) -> Option<f32> {
+        let left = self.deadline_left()?;
+        if self.anim.deadline_total == 0 {
+            return None;
+        }
+        Some((left as f32 / self.anim.deadline_total as f32).clamp(0.0, 1.0))
+    }
+
+    /// Raise presets: (label, raise-to) clamped to what's legal.
+    pub fn raise_presets(&self) -> Option<[(&'static str, u64); 4]> {
+        let legal = self.my_legal()?;
+        let view = self.view.as_ref()?;
+        if !legal.can_raise {
+            return None;
+        }
+        let on_table: u64 = view.seats.iter().map(|s| s.bet).sum();
+        let pot_after_call = view.pot + on_table + legal.to_call;
+        let clamp = |v: u64| v.clamp(legal.min_raise_to, legal.max_raise_to.max(legal.min_raise_to));
+        Some([
+            ("Min", legal.min_raise_to),
+            ("½ Pot", clamp(view.current_bet + pot_after_call / 2)),
+            ("Pot", clamp(view.current_bet + pot_after_call)),
+            ("Max", legal.max_raise_to.max(legal.min_raise_to)),
+        ])
     }
 
     fn apply_result(&mut self, result: HandResult) {
@@ -185,8 +320,9 @@ impl App {
             .my_seat
             .is_some_and(|me| result.pots.iter().any(|p| p.winners.contains(&me)));
         if i_won {
-            self.celebrate_until = Some(Instant::now() + Duration::from_millis(1600));
+            self.celebrate_until = Some(Instant::now() + Duration::from_millis(2400));
         }
+        self.anim.result_at = Some(Instant::now());
         // The next hand re-deals; drop stale cards until the deal arrives.
         self.my_cards.clear();
     }
@@ -307,6 +443,29 @@ impl App {
         }
     }
 
+    fn send(&mut self, mv: Move) {
+        if self.my_turn() {
+            let _ = self.net.send(NetCommand::Action(mv));
+        } else if self.mode == Mode::Spectator {
+            self.set_notice("you are watching this table");
+        } else {
+            self.set_notice("not your turn yet");
+        }
+    }
+
+    fn open_raise(&mut self) {
+        match self.raise_presets() {
+            Some(p) => self.raise = Some(RaisePicker { amount: p[0].1, typed: None }),
+            None if self.my_turn() => self.set_notice("raising isn't available · try call or all-in"),
+            None => self.set_notice("not your turn yet"),
+        }
+    }
+
+    fn can_deal(&self) -> bool {
+        self.mode == Mode::Host && self.view.as_ref().is_some_and(|v| v.phase != Phase::Betting)
+    }
+
+    /// Returns true if the key changed anything.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
@@ -316,69 +475,113 @@ impl App {
             self.help = false;
             return true;
         }
-        match key.code {
-            KeyCode::Esc => {
-                if self.input.is_empty() {
-                    self.quit = true;
-                } else {
+        if self.confirm_leave {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.leave = true,
+                _ => self.confirm_leave = false,
+            }
+            return true;
+        }
+        if self.raise.is_some() {
+            self.key_raise(key);
+            return true;
+        }
+        if self.chat_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.chat_mode = false;
+                    self.input.clear();
+                }
+                KeyCode::Enter => {
+                    let text = self.input.trim().to_string();
                     self.input.clear();
                     self.chat_mode = false;
-                }
-                true
-            }
-            KeyCode::Enter => {
-                self.submit();
-                true
-            }
-            KeyCode::Backspace => {
-                self.input.pop();
-                true
-            }
-            KeyCode::Char(c) => {
-                if self.input.is_empty() && !self.chat_mode {
-                    match c {
-                        'f' => {
-                            let _ = self.net.send(NetCommand::Action(Move::Fold));
-                            return true;
-                        }
-                        'x' => {
-                            let _ = self.net.send(NetCommand::Action(Move::Check));
-                            return true;
-                        }
-                        'c' => {
-                            let _ = self.net.send(NetCommand::Action(Move::Call));
-                            return true;
-                        }
-                        'a' => {
-                            let _ = self.net.send(NetCommand::Action(Move::AllIn));
-                            return true;
-                        }
-                        'r' | 'b' => {
-                            self.input.push(c);
-                            self.input.push(' ');
-                            return true;
-                        }
-                        '/' => {
-                            self.chat_mode = true;
-                            return true;
-                        }
-                        '?' => {
-                            self.help = true;
-                            return true;
-                        }
-                        's' if self.mode == Mode::Host => {
-                            let _ = self.net.send(NetCommand::Start);
-                            return true;
-                        }
-                        _ => {}
+                    if !text.is_empty() {
+                        let _ = self.net.send(NetCommand::Chat(text));
                     }
                 }
-                if c.is_ascii_graphic() || c == ' ' {
-                    self.input.push(c);
+                KeyCode::Backspace => {
+                    self.input.pop();
                 }
-                true
+                KeyCode::Char(c) if self.input.chars().count() < 200 => self.input.push(c),
+                _ => {}
             }
-            _ => false,
+            return true;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.confirm_leave = true,
+            KeyCode::Char('1') | KeyCode::Char('f') => self.send(Move::Fold),
+            KeyCode::Char('2') => {
+                let mv = match self.my_legal() {
+                    Some(l) if l.can_check => Move::Check,
+                    _ => Move::Call,
+                };
+                self.send(mv);
+            }
+            KeyCode::Char('x') => self.send(Move::Check),
+            KeyCode::Char('c') => self.send(Move::Call),
+            KeyCode::Char('3') | KeyCode::Char('r') | KeyCode::Char('b') => self.open_raise(),
+            KeyCode::Char('4') | KeyCode::Char('a') => self.send(Move::AllIn),
+            KeyCode::Char('t') | KeyCode::Char('/') => self.chat_mode = true,
+            KeyCode::Char('?') | KeyCode::Char('h') => self.help = true,
+            KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('d') if self.can_deal() => {
+                let _ = self.net.send(NetCommand::Start);
+            }
+            KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('d') if self.mode == Mode::Host => {
+                self.set_notice("a hand is already running");
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn key_raise(&mut self, key: KeyEvent) {
+        let Some(presets) = self.raise_presets() else {
+            // Turn moved on while the picker was open.
+            self.raise = None;
+            return;
+        };
+        let (min, max) = (presets[0].1, presets[3].1);
+        let bb = self.view.as_ref().map(|v| v.big_blind).unwrap_or(1).max(1);
+        let Some(picker) = self.raise.as_mut() else { return };
+        match key.code {
+            KeyCode::Esc => self.raise = None,
+            KeyCode::Enter => {
+                let to = picker.amount.clamp(min, max);
+                self.raise = None;
+                self.send(Move::Raise { to });
+            }
+            KeyCode::Char(c @ ('m' | 'h' | 'p' | 'a' | 'M' | 'H' | 'P' | 'A')) => {
+                let idx = "mhpa".find(c.to_ascii_lowercase()).unwrap_or(0);
+                picker.typed = None;
+                picker.amount = presets[idx].1;
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                let buf = picker.typed.get_or_insert_with(String::new);
+                if buf.len() < 12 {
+                    buf.push(c);
+                }
+                picker.amount = buf.parse().unwrap_or(0);
+            }
+            KeyCode::Backspace => {
+                if let Some(buf) = picker.typed.as_mut() {
+                    buf.pop();
+                    picker.amount = buf.parse().unwrap_or(0);
+                    if buf.is_empty() {
+                        picker.typed = None;
+                        picker.amount = min;
+                    }
+                }
+            }
+            KeyCode::Left | KeyCode::Down => {
+                picker.typed = None;
+                picker.amount = picker.amount.saturating_sub(bb).clamp(min, max);
+            }
+            KeyCode::Right | KeyCode::Up => {
+                picker.typed = None;
+                picker.amount = picker.amount.saturating_add(bb).clamp(min, max);
+            }
+            _ => {}
         }
     }
 }

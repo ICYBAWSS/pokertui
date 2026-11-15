@@ -30,6 +30,8 @@ pub fn data_dir() -> Result<PathBuf> {
 pub struct Config {
     pub name: Option<String>,
     pub broker: Option<String>,
+    /// Last custom table settings: "stack,sb,bb,seats,timer_s,rebuy".
+    pub custom: Option<String>,
 }
 
 impl Config {
@@ -60,6 +62,7 @@ fn toml_lite(text: &str) -> Config {
         match k.trim() {
             "name" if !v.is_empty() => cfg.name = Some(v),
             "broker" if !v.is_empty() => cfg.broker = Some(v),
+            "custom" if !v.is_empty() => cfg.custom = Some(v),
             _ => {}
         }
     }
@@ -75,6 +78,9 @@ pub fn save_config(cfg: &Config) -> Result<()> {
     if let Some(broker) = &cfg.broker {
         out.push_str(&format!("broker = \"{broker}\"\n"));
     }
+    if let Some(custom) = &cfg.custom {
+        out.push_str(&format!("custom = \"{custom}\"\n"));
+    }
     fs::write(dir.join("config.toml"), out)?;
     Ok(())
 }
@@ -85,8 +91,21 @@ struct IdentityFile {
 }
 
 /// Load the persistent player identity, creating one on first run.
+/// Only the first running `poker` process gets it: the host drops packets signed
+/// with its own key, so a second process on the same account (host + join on one
+/// machine) must not share it. Later processes get a throwaway identity.
 pub fn load_or_create_identity() -> Result<Identity> {
-    let path = config_dir()?.join("identity.json");
+    let dir = config_dir()?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join("identity.lock"))?;
+    if lock.try_lock().is_err() {
+        return Identity::generate();
+    }
+    std::mem::forget(lock); // held until the process exits
+    let path = dir.join("identity.json");
     if let Ok(text) = fs::read_to_string(&path)
         && let Ok(file) = serde_json::from_str::<IdentityFile>(&text)
         && let Ok(id) = Identity::from_seed_b64(&file.seed)

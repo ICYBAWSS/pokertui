@@ -246,6 +246,11 @@ impl Client {
                     let _ = self.tx.send(UiEvent::Error(message));
                 }
             }
+            Payload::Closed { reason } => {
+                if self.host.as_ref() == Some(&env.from) {
+                    self.done = Some(reason);
+                }
+            }
             Payload::RequestState { .. } => {}
             _ => {}
         }

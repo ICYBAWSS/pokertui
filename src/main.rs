@@ -7,7 +7,8 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use pokertui::app::App;
+use pokertui::app::{App, Mode};
+use pokertui::menu::{Launch, Menu, MenuOut};
 use pokertui::game::{TableParams, verify_record};
 use pokertui::net::{ClientConfig, HostConfig, NetCommand, UiEvent, roomcode, run_client, run_host};
 use pokertui::{art, store, ui};
@@ -19,11 +20,11 @@ use std::time::Duration;
 #[command(
     name = "poker",
     version,
-    about = "Terminal Texas Hold'em over public pub/sub relays — no server required"
+    about = "Terminal Texas Hold'em over public pub/sub relays — no server required. Run `poker` for the menu."
 )]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
     /// Relay endpoint, e.g. wss://broker.emqx.io:8084/mqtt
     #[arg(long, global = true, env = "POKER_BROKER")]
     broker: Option<String>,
@@ -37,7 +38,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a table and wait for players
+    /// Create a table and wait for players (skips the menu)
     Host {
         #[arg(long)]
         name: Option<String>,
@@ -55,12 +56,13 @@ enum Cmd {
         #[arg(long)]
         no_rebuy: bool,
     },
-    /// Join a table by room code
+    /// Join a table by room code (skips the menu)
     Join {
         code: String,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long, default_value_t = 5_000)]
+        /// Chips to sit down with (capped at the table's starting stack)
+        #[arg(long, default_value_t = u64::MAX, hide_default_value = true)]
         buyin: u64,
     },
     /// Watch a table without sitting down
@@ -74,19 +76,14 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pokertui=warn,rumqttc=error".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
     let cli = Cli::parse();
+    let tui = !cli.plain && !matches!(cli.cmd, Some(Cmd::Verify { .. } | Cmd::Replay { .. } | Cmd::Art));
+    init_logging(tui);
 
     match &cli.cmd {
-        Cmd::Verify { file } => return verify(file),
-        Cmd::Replay { file } => return replay(file),
-        Cmd::Art => {
+        Some(Cmd::Verify { file }) => return verify(file),
+        Some(Cmd::Replay { file }) => return replay(file),
+        Some(Cmd::Art) => {
             print!("{}", art::LOBBY);
             return Ok(());
         }
@@ -96,37 +93,20 @@ fn main() -> Result<()> {
     let config = store::Config::load();
     let identity = Arc::new(store::load_or_create_identity()?);
     let broker = cli.broker.clone().or(config.broker.clone());
-    let default_name = config
-        .name
-        .clone()
-        .unwrap_or_else(store::default_name);
-
-    let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<NetCommand>();
+    let default_name = config.name.clone().unwrap_or_else(store::default_name);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building async runtime")?;
 
-    let (mode, code, app_broker) = match cli.cmd {
-        Cmd::Host {
-            name,
-            seats,
-            blinds,
-            buyin,
-            timer,
-            no_rebuy,
-        } => {
+    let launch = match cli.cmd {
+        Some(Cmd::Host { name, seats, blinds, buyin, timer, no_rebuy }) => {
             let (small_blind, big_blind) = parse_blinds(&blinds)?;
-            if seats < 2 || seats > 9 {
+            if !(2..=9).contains(&seats) {
                 bail!("--seats must be between 2 and 9");
             }
-            let (room, code) = roomcode::generate()?;
-            let cfg = HostConfig {
-                identity: identity.clone(),
-                code: code.clone(),
-                room,
-                name: name.unwrap_or(default_name),
+            Some(Launch::Host {
+                name: name.unwrap_or_else(|| default_name.clone()),
                 params: TableParams {
                     max_seats: seats,
                     small_blind,
@@ -134,66 +114,121 @@ fn main() -> Result<()> {
                     buyin,
                     turn_ms: timer.saturating_mul(1000),
                 },
-                broker: broker.clone(),
                 auto_rebuy: !no_rebuy,
-            };
-            let tx = ui_tx.clone();
-            runtime.spawn(async move {
-                if let Err(e) = run_host(cfg, tx, cmd_rx).await {
-                    eprintln!("host stopped: {e:#}");
-                }
-            });
-            (pokertui::app::Mode::Host, code, broker_display(&broker))
+            })
         }
-        Cmd::Join { code, name, buyin } => {
-            let room = roomcode::decode(&code)?;
-            let cfg = ClientConfig {
-                identity: identity.clone(),
-                code: code.clone(),
-                room,
-                name: name.unwrap_or(default_name),
-                buyin,
-                broker: broker.clone(),
-                spectate: false,
-            };
-            let tx = ui_tx.clone();
-            runtime.spawn(async move {
-                if let Err(e) = run_client(cfg, tx, cmd_rx).await {
-                    eprintln!("client stopped: {e:#}");
-                }
-            });
-            (pokertui::app::Mode::Client, code, broker_display(&broker))
+        Some(Cmd::Join { code, name, buyin }) => {
+            roomcode::decode(&code)?;
+            Some(Launch::Join { name: name.unwrap_or_else(|| default_name.clone()), code, buyin })
         }
-        Cmd::Spectate { code } => {
-            let room = roomcode::decode(&code)?;
-            let cfg = ClientConfig {
-                identity: identity.clone(),
-                code: code.clone(),
-                room,
-                name: "spectator".into(),
-                buyin: 0,
-                broker: broker.clone(),
-                spectate: true,
-            };
-            let tx = ui_tx.clone();
-            runtime.spawn(async move {
-                if let Err(e) = run_client(cfg, tx, cmd_rx).await {
-                    eprintln!("spectator stopped: {e:#}");
-                }
-            });
-            (pokertui::app::Mode::Spectator, code, broker_display(&broker))
+        Some(Cmd::Spectate { code }) => {
+            roomcode::decode(&code)?;
+            Some(Launch::Spectate { code })
         }
-        _ => unreachable!(),
+        _ => None,
     };
 
-    let app = App::new(mode, code, app_broker, cmd_tx, !cli.no_art);
+    let session = Session { runtime: &runtime, identity, broker, show_art: !cli.no_art };
     let result = if cli.plain {
-        run_plain(app, ui_rx)
+        let launch = launch.context("--plain needs a subcommand: host, join or spectate")?;
+        let (app, rx) = session.start(launch)?;
+        run_plain(app, rx)
     } else {
-        run_tui(app, ui_rx)
+        run_tui(&session, launch, config)
     };
     runtime.shutdown_background();
     result
+}
+
+/// Logs go to stderr in plain mode and to a file under the TUI, where stderr
+/// would scribble over the screen.
+fn init_logging(tui: bool) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "pokertui=warn,rumqttc=error".into());
+    let file = tui
+        .then(|| store::data_dir().ok())
+        .flatten()
+        .and_then(|dir| std::fs::OpenOptions::new().create(true).append(true).open(dir.join("poker.log")).ok());
+    match file {
+        Some(file) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init(),
+    }
+}
+
+struct Session<'a> {
+    runtime: &'a tokio::runtime::Runtime,
+    identity: Arc<pokertui::crypto::Identity>,
+    broker: Option<String>,
+    show_art: bool,
+}
+
+impl Session<'_> {
+    /// Spawn the host or client task for one table and build its UI state.
+    fn start(&self, launch: Launch) -> Result<(App, std::sync::mpsc::Receiver<UiEvent>)> {
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<NetCommand>();
+        let tx = ui_tx.clone();
+        let (mode, code) = match launch {
+            Launch::Host { name, params, auto_rebuy } => {
+                let (room, code) = roomcode::generate()?;
+                let cfg = HostConfig {
+                    identity: self.identity.clone(),
+                    code: code.clone(),
+                    room,
+                    name,
+                    params,
+                    broker: self.broker.clone(),
+                    auto_rebuy,
+                };
+                self.runtime.spawn(async move {
+                    if let Err(e) = run_host(cfg, tx.clone(), cmd_rx).await {
+                        let _ = tx.send(UiEvent::Closed(format!("host stopped: {e:#}")));
+                    }
+                });
+                (Mode::Host, code)
+            }
+            Launch::Join { name, code, buyin } => {
+                let cfg = ClientConfig {
+                    identity: self.identity.clone(),
+                    code: code.clone(),
+                    room: roomcode::decode(&code)?,
+                    name,
+                    buyin,
+                    broker: self.broker.clone(),
+                    spectate: false,
+                };
+                self.runtime.spawn(async move {
+                    if let Err(e) = run_client(cfg, tx.clone(), cmd_rx).await {
+                        let _ = tx.send(UiEvent::Closed(format!("could not join: {e:#}")));
+                    }
+                });
+                (Mode::Client, code)
+            }
+            Launch::Spectate { code } => {
+                let cfg = ClientConfig {
+                    identity: self.identity.clone(),
+                    code: code.clone(),
+                    room: roomcode::decode(&code)?,
+                    name: "spectator".into(),
+                    buyin: 0,
+                    broker: self.broker.clone(),
+                    spectate: true,
+                };
+                self.runtime.spawn(async move {
+                    if let Err(e) = run_client(cfg, tx.clone(), cmd_rx).await {
+                        let _ = tx.send(UiEvent::Closed(format!("could not watch: {e:#}")));
+                    }
+                });
+                (Mode::Spectator, code)
+            }
+        };
+        let app = App::new(mode, code, broker_display(&self.broker), cmd_tx, self.show_art);
+        Ok((app, ui_rx))
+    }
 }
 
 fn broker_display(broker: &Option<String>) -> String {
@@ -276,33 +311,86 @@ fn replay(file: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_tui(mut app: App, mut ui_rx: std::sync::mpsc::Receiver<UiEvent>) -> Result<()> {
-    use ratatui::crossterm::event::{self, Event, KeyEventKind};
-
+/// Menu → table → menu … in one terminal session.
+fn run_tui(session: &Session, mut pending: Option<Launch>, config: store::Config) -> Result<()> {
     let mut terminal = ratatui::init();
+    let mut menu = Menu::new(config, session.show_art);
     let result = (|| -> Result<()> {
         loop {
-            app.pump(&mut ui_rx);
-            app.on_tick();
-            terminal.draw(|frame| ui::draw(frame, &app))?;
-            if app.quit {
-                break;
-            }
-            if event::poll(Duration::from_millis(50))? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        app.handle_key(key);
-                    }
-                    Event::Resize(_, _) => {}
-                    _ => {}
+            let launch = match pending.take() {
+                Some(launch) => launch,
+                None => match run_menu(&mut terminal, &mut menu)? {
+                    Some(launch) => launch,
+                    None => return Ok(()),
+                },
+            };
+            let (app, rx) = match session.start(launch) {
+                Ok(started) => started,
+                Err(e) => {
+                    menu.back_to_main(Some(format!("{e:#}")));
+                    continue;
                 }
+            };
+            match run_table(&mut terminal, app, rx)? {
+                TableExit::Quit => return Ok(()),
+                TableExit::Menu(reason) => menu.back_to_main(reason),
             }
         }
-        Ok(())
     })();
     ratatui::restore();
-    let _ = app.net.send(NetCommand::Quit);
     result
+}
+
+fn run_menu(terminal: &mut ratatui::DefaultTerminal, menu: &mut Menu) -> Result<Option<Launch>> {
+    use ratatui::crossterm::event::{self, Event, KeyEventKind};
+    loop {
+        menu.tick += 1;
+        terminal.draw(|frame| pokertui::menu::draw(frame, menu))?;
+        if event::poll(Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match menu.handle_key(key) {
+                Some(MenuOut::Launch(launch)) => return Ok(Some(launch)),
+                Some(MenuOut::Quit) => return Ok(None),
+                None => {}
+            }
+        }
+    }
+}
+
+enum TableExit {
+    Quit,
+    Menu(Option<String>),
+}
+
+fn run_table(
+    terminal: &mut ratatui::DefaultTerminal,
+    mut app: App,
+    mut ui_rx: std::sync::mpsc::Receiver<UiEvent>,
+) -> Result<TableExit> {
+    use ratatui::crossterm::event::{self, Event, KeyEventKind};
+    let exit = loop {
+        app.pump(&mut ui_rx);
+        app.on_tick();
+        terminal.draw(|frame| ui::draw(frame, &app))?;
+        if app.quit {
+            break TableExit::Quit;
+        }
+        if app.leave {
+            break TableExit::Menu(app.closed.clone());
+        }
+        if event::poll(Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            app.handle_key(key);
+        }
+    };
+    // Free our seat, then stop the network task for this table.
+    let _ = app.net.send(NetCommand::Leave);
+    let _ = app.net.send(NetCommand::Quit);
+    Ok(exit)
 }
 
 fn run_plain(mut app: App, ui_rx: std::sync::mpsc::Receiver<UiEvent>) -> Result<()> {

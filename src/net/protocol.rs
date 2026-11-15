@@ -23,6 +23,10 @@ pub fn now_ms() -> u64 {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "body", rename_all = "snake_case")]
 pub enum Payload {
+    /// The host is shutting the table down.
+    Closed {
+        reason: String,
+    },
     JoinRequest {
         name: String,
         buyin: u64,
