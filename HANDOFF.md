@@ -5,9 +5,9 @@ MQTT-over-WebSocket broker. The host's client is the dealer, every packet is sig
 hole cards are sealed to each player's key, and each deck is committed before the
 deal and revealed after the hand.
 
-- **Location:** `/Users/rayhan/pokertui` (≈5,400 lines of Rust)
+- **Location:** `/Users/rayhan/pokertui` (≈6,000 lines of Rust)
 - **Status:** engine, crypto, transport, host/client loops and TUI are implemented and
-  compile; 30 unit tests pass; a live 3-player hand completes over the public broker
+  compile; 42 unit tests pass; a live 3-player hand completes over the public broker
   in ~5 s (EMQX) / ~3 s (Mosquitto). No known open protocol bugs; see §3 for the two
   that were fixed.
 - **Rust:** 1.97.1, edition 2024.
@@ -175,7 +175,8 @@ tests/net_live.rs         ignored live test (host + 2 bots + real broker)
 examples/probe.rs         transport gate (run: cargo run --example probe)
 assets/art/lobby.txt      84×24 slot-cabinet splash ("GOOD LUCK")
 assets/art/win.txt        96×16 fireworks strip for the win overlay
-scripts/                  (empty — see §6 for the art commands to put here)
+scripts/pi_probe.py       stdlib-only MQTT-over-WSS probe for new machines (Pi)
+scripts/gen-art.sh        regenerates assets/art/* from ascii-magic-art
 ```
 
 ---
@@ -195,7 +196,7 @@ npx ascii-magic-art@1.1.0 fireworks --frame --look=ascii > /tmp/win.txt
 `poker art` prints the lobby piece; `--no-art` disables both; lobby art only renders
 when the terminal is at least 84×26, otherwise a compact wordmark is used.
 
-Worth adding `scripts/gen-art.sh` with the crop steps (Python is used in-shell today).
+`scripts/gen-art.sh` performs the render + crop and is reproducible (identical bytes on rerun).
 
 ---
 
