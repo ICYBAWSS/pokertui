@@ -6,6 +6,24 @@ So I made this poker game that runs right in your terminal. One person hosts, ev
 
 There's no setup, no websites, no server to manage u just open up your terminal and play.
 
+## Screenshots
+
+**Menu**
+
+![Main menu](assets/screens/menu.png)
+
+**Lobby**
+
+![Lobby](assets/screens/lobby.png)
+
+**Your turn** — the table border and buttons light up gold and the terminal bell rings
+
+![Your turn](assets/screens/your-turn.png)
+
+**Showdown**
+
+![Showdown](assets/screens/showdown.png)
+
 ## Getting started
 
 **macOS / Linux / Raspberry Pi (64-bit)**
