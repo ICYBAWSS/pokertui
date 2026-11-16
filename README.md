@@ -42,12 +42,25 @@ not meant for production traffic. Play with people you trust: the host deals.
 
 ## Install
 
+**macOS / Linux / Raspberry Pi (64-bit)**
+
 ```bash
-cargo install --git https://github.com/ICYBAWSS/pokertui --locked
-poker
+curl -fsSL https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.sh | sh
 ```
 
-That's it: `poker` opens the menu. **Host** picks a game type, **Join** asks for the
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.ps1 | iex
+```
+
+**Anywhere with Rust**
+
+```bash
+cargo install --git https://github.com/ICYBAWSS/pokertui --locked
+```
+
+Then run `poker`, which opens the menu. **Host** picks a game type, **Join** asks for the
 code your friend shares.
 
 | game type | blinds | stacks | seats | clock |
