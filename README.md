@@ -38,6 +38,18 @@ curl -fsSL https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.sh |
 irm https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.ps1 | iex
 ```
 
+**Just trying it? Run it without installing.** Nothing is kept: the game runs from a temporary folder and everything, including your saved name and hand history, is deleted when you quit.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.sh | sh -s -- --temp
+```
+
+On Windows:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.ps1))) -Temp
+```
+
 **Or install directly with Rust:**
 
 ```bash

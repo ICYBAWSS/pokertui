@@ -1,6 +1,8 @@
 #!/bin/sh
 # Install the latest `poker` release on macOS or Linux:
 #   curl -fsSL https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.sh | sh
+# Play once without installing (everything is deleted when you quit):
+#   curl -fsSL https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.sh | sh -s -- --temp
 # Set POKER_INSTALL_DIR to choose where it goes (default ~/.local/bin).
 set -eu
 
@@ -22,11 +24,19 @@ esac
 
 url="https://github.com/$REPO/releases/latest/download/poker-$target.tar.gz"
 echo "Downloading poker for $target..."
-mkdir -p "$DIR"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp"' EXIT INT TERM
 curl -fsSL "$url" -o "$tmp/poker.tar.gz"
 tar -xzf "$tmp/poker.tar.gz" -C "$tmp"
+
+if [ "${1:-}" = "--temp" ]; then
+  # Run from the temp folder, keep config/history there too, delete it all on exit.
+  chmod +x "$tmp/poker"
+  POKER_HOME="$tmp/home" "$tmp/poker" </dev/tty || true
+  exit 0
+fi
+
+mkdir -p "$DIR"
 mv "$tmp/poker" "$DIR/poker"
 chmod +x "$DIR/poker"
 

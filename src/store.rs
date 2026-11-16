@@ -14,14 +14,22 @@ fn project() -> Result<ProjectDirs> {
         .context("no home directory for config/history")
 }
 
+/// `POKER_HOME` keeps everything in one folder (used by the installer's run-once mode).
+fn dir_for(pick: fn(&ProjectDirs) -> &Path) -> Result<PathBuf> {
+    match std::env::var_os("POKER_HOME") {
+        Some(home) => Ok(PathBuf::from(home)),
+        None => Ok(pick(&project()?).to_path_buf()),
+    }
+}
+
 pub fn config_dir() -> Result<PathBuf> {
-    let dir = project()?.config_dir().to_path_buf();
+    let dir = dir_for(ProjectDirs::config_dir)?;
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
 pub fn data_dir() -> Result<PathBuf> {
-    let dir = project()?.data_dir().to_path_buf();
+    let dir = dir_for(ProjectDirs::data_dir)?;
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
