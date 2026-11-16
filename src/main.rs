@@ -373,6 +373,10 @@ fn run_table(
     let exit = loop {
         app.pump(&mut ui_rx);
         app.on_tick();
+        if std::mem::take(&mut app.bell) {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(b"\x07").and_then(|_| std::io::stdout().flush());
+        }
         terminal.draw(|frame| ui::draw(frame, &app))?;
         if app.quit {
             break TableExit::Quit;

@@ -102,6 +102,8 @@ pub struct App {
     pub confirm_leave: bool,
     pub raise: Option<RaisePicker>,
     pub anim: Anim,
+    /// Ring the terminal bell: your turn just started.
+    pub bell: bool,
 }
 
 impl App {
@@ -139,6 +141,7 @@ impl App {
             confirm_leave: false,
             raise: None,
             anim: Anim::default(),
+            bell: false,
         }
     }
 
@@ -162,16 +165,14 @@ impl App {
             UiEvent::Connected { broker } => {
                 self.connected = true;
                 self.broker = broker;
-                self.push_log(LogKind::Info, "connected to relay");
             }
             UiEvent::Disconnected(reason) => {
                 self.connected = false;
                 self.push_log(LogKind::Error, format!("relay: {reason}"));
-                self.set_notice("relay disconnected, reconnecting…");
+                self.set_notice("reconnecting…");
             }
             UiEvent::Joined { seat } => {
                 self.my_seat = Some(seat);
-                self.push_log(LogKind::Info, format!("you are in seat {seat}"));
             }
             UiEvent::View(view) => self.apply_view(view),
             UiEvent::MyCards { hand, cards } => {
@@ -197,6 +198,7 @@ impl App {
     }
 
     fn apply_view(&mut self, view: TableView) {
+        let was_my_turn = self.my_legal().is_some();
         if !view.message.is_empty() && view.message != self.last_message {
             self.last_message = view.message.clone();
             self.push_log(LogKind::Action, view.message.clone());
@@ -207,12 +209,16 @@ impl App {
             let result = result.clone();
             self.apply_result(result);
         }
-        // Clear hole cards that belong to a hand that has ended.
-        if view.phase == Phase::Lobby {
+        // Keep your cards on show through the result; drop them once a
+        // different hand is being played (its deal replaces them).
+        if view.phase == Phase::Lobby || (view.phase == Phase::Betting && view.hand_no != self.my_cards_hand) {
             self.my_cards.clear();
         }
         self.note_animations(&view);
         self.view = Some(view);
+        if !was_my_turn && self.my_legal().is_some() {
+            self.bell = true;
+        }
     }
 
     /// Compare the incoming view with the current one and start animations.
@@ -304,18 +310,6 @@ impl App {
             return;
         }
         self.result_seen = Some(result.hand_no);
-        for pot in &result.pots {
-            let names = pot
-                .winners
-                .iter()
-                .map(|&w| self.seat_name(w))
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.push_log(
-                LogKind::Action,
-                format!("{} wins {} ({})", names, pot.amount, pot.desc),
-            );
-        }
         let i_won = self
             .my_seat
             .is_some_and(|me| result.pots.iter().any(|p| p.winners.contains(&me)));
@@ -323,8 +317,6 @@ impl App {
             self.celebrate_until = Some(Instant::now() + Duration::from_millis(2400));
         }
         self.anim.result_at = Some(Instant::now());
-        // The next hand re-deals; drop stale cards until the deal arrives.
-        self.my_cards.clear();
     }
 
     pub fn seat_name(&self, seat: usize) -> String {
@@ -447,17 +439,17 @@ impl App {
         if self.my_turn() {
             let _ = self.net.send(NetCommand::Action(mv));
         } else if self.mode == Mode::Spectator {
-            self.set_notice("you are watching this table");
+            self.set_notice("you're watching");
         } else {
-            self.set_notice("not your turn yet");
+            self.set_notice("not your turn");
         }
     }
 
     fn open_raise(&mut self) {
         match self.raise_presets() {
             Some(p) => self.raise = Some(RaisePicker { amount: p[0].1, typed: None }),
-            None if self.my_turn() => self.set_notice("raising isn't available · try call or all-in"),
-            None => self.set_notice("not your turn yet"),
+            None if self.my_turn() => self.set_notice("can't raise"),
+            None => self.set_notice("not your turn"),
         }
     }
 
@@ -528,7 +520,7 @@ impl App {
                 let _ = self.net.send(NetCommand::Start);
             }
             KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('d') if self.mode == Mode::Host => {
-                self.set_notice("a hand is already running");
+                self.set_notice("hand in progress");
             }
             _ => return false,
         }

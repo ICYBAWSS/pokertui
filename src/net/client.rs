@@ -55,17 +55,6 @@ pub async fn run_client(
     let _ = tx.send(UiEvent::Connected {
         broker: link.broker.clone(),
     });
-    if cfg.spectate {
-        let _ = tx.send(UiEvent::Info(format!(
-            "spectating room {} · relay {}",
-            cfg.code, link.broker
-        )));
-    } else {
-        let _ = tx.send(UiEvent::Info(format!(
-            "joining room {} via {}",
-            cfg.code, link.broker
-        )));
-    }
 
     let mut client = Client::new(cfg, topics, tx.clone());
     if !client.cfg.spectate {

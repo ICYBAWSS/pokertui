@@ -300,7 +300,7 @@ impl Table {
             min_raise: 0,
             deadline_ms: 0,
             last_result: None,
-            message: "waiting for players".into(),
+            message: String::new(),
             actions: Vec::new(),
             start_stacks: vec![0; n],
             started_at_ms: 0,
@@ -353,11 +353,13 @@ impl Table {
         enc_pub: &str,
         buyin: u64,
     ) -> Result<SeatId> {
-        if self.phase == Phase::Betting {
-            bail!("a hand is in progress");
-        }
+        // Already seated first: a client whose JoinAccept was lost retries,
+        // and must get its seat back even mid-hand.
         if let Some(existing) = self.seat_of(pubkey) {
             return Ok(existing);
+        }
+        if self.phase == Phase::Betting {
+            bail!("a hand is in progress");
         }
         let seat = self
             .seats
@@ -1198,6 +1200,15 @@ mod tests {
 
     fn actor(t: &Table) -> usize {
         t.actor.expect("someone should be to act")
+    }
+
+    #[test]
+    fn rejoin_mid_hand_returns_existing_seat() {
+        // A lost JoinAccept makes the client retry after the deal.
+        let mut t = rig(3, 1000);
+        assert_eq!(t.phase, Phase::Betting);
+        assert_eq!(t.join("p1", "key1", "enc1", 1000).unwrap(), 1);
+        assert!(t.join("new", "keyX", "encX", 1000).is_err(), "strangers still wait");
     }
 
     #[test]

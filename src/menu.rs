@@ -115,29 +115,24 @@ impl Settings {
 
 pub struct Preset {
     pub name: &'static str,
-    pub blurb: &'static str,
     pub settings: Settings,
 }
 
 pub const PRESETS: [Preset; 4] = [
     Preset {
         name: "Quick Game",
-        blurb: "the classic: 100 big blinds deep, relaxed clock",
         settings: Settings { stack: 5_000, sb: 25, bb: 50, seats: 6, timer_s: 30, rebuy: true },
     },
     Preset {
         name: "High Roller",
-        blurb: "big numbers, big pots, same 100 BB depth",
         settings: Settings { stack: 100_000, sb: 500, bb: 1_000, seats: 6, timer_s: 45, rebuy: true },
     },
     Preset {
         name: "Turbo",
-        blurb: "30 BB stacks and a 15 s clock: shove-or-fold action",
         settings: Settings { stack: 3_000, sb: 50, bb: 100, seats: 6, timer_s: 15, rebuy: true },
     },
     Preset {
         name: "Heads-Up",
-        blurb: "just you and one rival",
         settings: Settings { stack: 5_000, sb: 50, bb: 100, seats: 2, timer_s: 30, rebuy: true },
     },
 ];
@@ -627,11 +622,6 @@ fn draw_splash(f: &mut Frame, area: Rect, m: &Menu) {
         f.render_widget(Paragraph::new(line).alignment(Alignment::Center), Rect::new(area.x, top + 2, area.width, 1));
     }
     let sub_y = top + if big { wh + 1 } else { 4 };
-    f.render_widget(
-        Paragraph::new(Span::styled("texas hold'em · no server · every deal signed & sealed", Style::default().fg(DIM)))
-            .alignment(Alignment::Center),
-        Rect::new(area.x, sub_y, area.width, 1),
-    );
 
     // Riffle: seven cards fan out from the middle.
     const CARDS: [(&str, bool); 7] =
@@ -695,8 +685,6 @@ fn name_panel(m: &Menu) -> Panel {
     let cursor = if m.tick / 10 % 2 == 0 { "█" } else { " " };
     let mut lines = vec![
         Line::from(""),
-        Line::from(Span::styled("  What should the table call you?", Style::default().fg(TEXT))),
-        Line::from(""),
         Line::from(vec![
             Span::styled("   ▸ ", Style::default().fg(GOLD)),
             Span::styled(format!("{:<16}", format!("{}{cursor}", m.input)), Style::default().fg(YOU).add_modifier(Modifier::BOLD).bg(Color::Rgb(25, 30, 28))),
@@ -706,7 +694,7 @@ fn name_panel(m: &Menu) -> Panel {
     if let Some(h) = &m.hint {
         lines.push(Line::from(Span::styled(format!("  {h}"), Style::default().fg(RED))));
     }
-    ("YOUR NAME", lines, "type your name · Enter save · Esc back")
+    ("YOUR NAME", lines, "Enter save · Esc back")
 }
 
 fn main_panel(m: &Menu) -> Panel {
@@ -716,34 +704,25 @@ fn main_panel(m: &Menu) -> Panel {
             Span::styled(m.name(), Style::default().fg(YOU).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(""),
-        item(m, 0, "1", "Host a table", "pick a game, share the code"),
-        item(m, 1, "2", "Join a table", "enter a friend's room code"),
-        item(m, 2, "3", "Watch a table", "spectate without sitting down"),
+        item(m, 0, "1", "Host a table", ""),
+        item(m, 1, "2", "Join a table", ""),
+        item(m, 2, "3", "Watch a table", ""),
         item(m, 3, "4", "Change name", ""),
         item(m, 4, "Q", "Quit", ""),
         Line::from(""),
     ];
-    ("MAIN MENU", lines, "↑↓ move · Enter select · or press a number")
+    ("MAIN MENU", lines, "↑↓ · Enter")
 }
 
 fn game_type_panel(m: &Menu) -> Panel {
     let mut lines = vec![Line::from("")];
     for (i, p) in PRESETS.iter().enumerate() {
         lines.push(item(m, i, &(i + 1).to_string(), p.name, &p.settings.summary()));
-        if m.sel == i {
-            lines.push(Line::from(Span::styled(format!("        {}", p.blurb), Style::default().fg(DIM).add_modifier(Modifier::ITALIC))));
-        }
     }
     let custom = PRESETS.len();
-    lines.push(item(m, custom, "5", "Custom", "set stacks, blinds, seats and clock yourself"));
-    if m.sel == custom {
-        lines.push(Line::from(Span::styled(
-            format!("        last used: {}", m.saved_custom().summary()),
-            Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-        )));
-    }
+    lines.push(item(m, custom, "5", "Custom", ""));
     lines.push(Line::from(""));
-    ("CHOOSE A GAME", lines, "number or Enter create table · E edit settings first · Esc back")
+    ("CHOOSE A GAME", lines, "Enter create · E edit · Esc back")
 }
 
 fn settings_panel(m: &Menu) -> Panel {
@@ -758,16 +737,16 @@ fn settings_panel(m: &Menu) -> Panel {
             text
         }
     };
-    let rows: [(&str, String, &str); FIELDS] = [
-        ("Starting stack (everyone)", value(F_STACK, chips(s.stack)), "←→ step · or type chips"),
-        ("Small blind", value(F_SB, chips(s.sb)), "←→ step · or type"),
-        ("Big blind", value(F_BB, chips(s.bb)), "never below the small blind"),
-        ("Seats", value(F_SEATS, s.seats.to_string()), "2 – 9"),
-        ("Turn timer", value(F_TIMER, if s.timer_s == 0 { "off".into() } else { format!("{} s", s.timer_s) }), "off · 10 … 120 s"),
-        ("Auto top-up busted players", if s.rebuy { "on".into() } else { "off".into() }, "←→ / space toggles"),
+    let rows: [(&str, String); FIELDS] = [
+        ("Starting stack", value(F_STACK, chips(s.stack))),
+        ("Small blind", value(F_SB, chips(s.sb))),
+        ("Big blind", value(F_BB, chips(s.bb))),
+        ("Seats", value(F_SEATS, s.seats.to_string())),
+        ("Turn timer", value(F_TIMER, if s.timer_s == 0 { "off".into() } else { format!("{} s", s.timer_s) })),
+        ("Auto top-up", if s.rebuy { "on".into() } else { "off".into() }),
     ];
     let mut lines = vec![Line::from("")];
-    for (i, (label, val, help)) in rows.into_iter().enumerate() {
+    for (i, (label, val)) in rows.into_iter().enumerate() {
         let active = m.field == i;
         lines.push(Line::from(vec![
             Span::styled(if active { " ▸ " } else { "   " }, Style::default().fg(GOLD)),
@@ -780,22 +759,14 @@ fn settings_panel(m: &Menu) -> Panel {
                     Style::default().fg(GOLD)
                 },
             ),
-            Span::styled(format!("  {help}"), Style::default().fg(if active { DIM } else { Color::Rgb(60, 66, 62) })),
         ]));
     }
     lines.push(Line::from(""));
-    let depth = if s.bb > 0 { format!("{} big blinds deep", s.stack / s.bb) } else { "—".into() };
-    lines.push(Line::from(vec![
-        Span::styled("   ── ", Style::default().fg(DIM)),
-        Span::styled(format!("{depth} · {}-max · {}", s.seats, timer_label(s.timer_s)), Style::default().fg(TEXT)),
-    ]));
     if let Some(h) = &m.hint {
         lines.push(Line::from(Span::styled(format!("   ✘ {h}"), Style::default().fg(RED))));
-    } else {
-        lines.push(Line::from(Span::styled("   ✔ ready", Style::default().fg(Color::Rgb(120, 210, 140)))));
+        lines.push(Line::from(""));
     }
-    lines.push(Line::from(""));
-    ("TABLE SETTINGS", lines, "↑↓ field · ←→ adjust · type a number · Enter create · Esc back")
+    ("TABLE SETTINGS", lines, "↑↓ ←→ · Enter create · Esc back")
 }
 
 fn code_panel(m: &Menu) -> Panel {
@@ -817,11 +788,6 @@ fn code_panel(m: &Menu) -> Panel {
     }
     let mut lines = vec![
         Line::from(""),
-        Line::from(Span::styled(
-            if m.screen == Screen::JoinCode { "  Enter the room code your host shared" } else { "  Enter the room code to watch" },
-            Style::default().fg(TEXT),
-        )),
-        Line::from(""),
         Line::from([vec![Span::raw("   ")], slots].concat()),
         Line::from(""),
     ];
@@ -830,7 +796,7 @@ fn code_panel(m: &Menu) -> Panel {
         lines.push(Line::from(""));
     }
     let title = if m.screen == Screen::JoinCode { "JOIN A TABLE" } else { "WATCH A TABLE" };
-    (title, lines, "type the code · Enter go · Backspace fix · Esc back")
+    (title, lines, "Enter go · Esc back")
 }
 
 #[cfg(test)]

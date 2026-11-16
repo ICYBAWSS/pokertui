@@ -126,17 +126,12 @@ impl Host {
         )?;
         self.host_seat = seat;
         self.table.set_ready(seat, true);
-        self.table.set_message("waiting for players");
         self.last_seen[seat] = Some(Instant::now());
 
         let _ = self.tx.send(UiEvent::Connected {
             broker: link.broker.clone(),
         });
         let _ = self.tx.send(UiEvent::Joined { seat });
-        let _ = self.tx.send(UiEvent::Info(format!(
-            "hosting room {} · relay {}",
-            self.cfg.code, link.broker
-        )));
         self.broadcast(link).await
     }
 
@@ -296,7 +291,6 @@ impl Host {
                 })?;
                 self.publish(link, &self.topics.events(), env.to_bytes()?, false)
                     .await;
-                let _ = self.tx.send(UiEvent::Info(format!("{name} joined seat {seat}")));
                 self.broadcast(link).await
             }
             Err(e) => self.send_error(link, pubkey, &e.to_string()).await,
@@ -409,12 +403,7 @@ impl Host {
         }
         if let Some(record) = self.table.hand_record(&self.topics.room) {
             match store::save_hand(&self.cfg.code, &record) {
-                Ok(path) => {
-                    let _ = self.tx.send(UiEvent::Info(format!(
-                        "hand history saved to {}",
-                        path.display()
-                    )));
-                }
+                Ok(_) => {}
                 Err(e) => {
                     let _ = self.tx.send(UiEvent::Info(format!("could not save history: {e}")));
                 }
