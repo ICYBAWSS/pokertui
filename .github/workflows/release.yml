@@ -1,10 +1,11 @@
-# Push a tag like v0.2.0 to build `poker` for every platform and attach the
-# archives to a GitHub release. install.sh / install.ps1 download from
-# releases/latest, so the newest tag is what users get.
+# Every push to main is tagged v0.1.<run number>, built for every platform and
+# attached to a GitHub release. Pushing a tag like v0.2.0 by hand also works.
+# install.sh / install.ps1 download from releases/latest, so users get the newest.
 name: release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -14,11 +15,17 @@ permissions:
 jobs:
   create-release:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - name: Create the release (no-op if it exists)
+      - name: Pick the tag and create the release (no-op if it exists)
+        id: tag
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes || true
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tag="$GITHUB_REF_NAME"; else tag="v0.1.$GITHUB_RUN_NUMBER"; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --generate-notes || true
 
   build:
     needs: create-release
@@ -55,6 +62,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.create-release.outputs.tag }}
         run: |
           cd target/${{ matrix.target }}/release
           if [ "$RUNNER_OS" = "Windows" ]; then
@@ -64,4 +72,4 @@ jobs:
             asset=poker-${{ matrix.target }}.tar.gz
             tar -czf "$asset" poker
           fi
-          gh release upload "$GITHUB_REF_NAME" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$TAG" "$asset" --repo "$GITHUB_REPOSITORY" --clobber

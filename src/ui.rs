@@ -48,7 +48,7 @@ pub const MIN_W: u16 = 80;
 pub const MIN_H: u16 = 24;
 /// Action panel height: room for BIG cards on tall terminals.
 fn panel_h(height: u16) -> u16 {
-    if height >= 40 { BIG.h + 2 } else { SMALL.h + 2 }
+    if height >= 28 { BIG.h + 2 } else { SMALL.h + 2 }
 }
 const SEAT_H: u16 = 3;
 
