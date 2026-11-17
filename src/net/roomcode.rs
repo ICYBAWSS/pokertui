@@ -1,29 +1,36 @@
 //! Human-friendly room codes.
 //!
-//! A room is a 40-bit random id rendered as 8 Crockford base32 characters, e.g.
-//! `K7Q2-9XZP`. The code is the capability: topics are derived from the id, so
-//! there is no directory to scan and no way to enumerate tables.
+//! A room is a 60-bit random secret rendered as 12 Crockford base32 characters,
+//! e.g. `K7Q2-9XZP-4M8T`. The code is the capability. Topic names and the key
+//! that encrypts every packet are *hashed from* the code, so someone who lists
+//! the public broker's topics sees opaque ids: they cannot join, read or spoof
+//! a table without the code.
 
 use crate::crypto::random_bytes;
 use anyhow::{Result, bail};
+use hkdf::Hkdf;
+use sha2::{Digest, Sha256};
 
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+pub const CODE_LEN: usize = 12;
 
-pub type RoomId = [u8; 5];
+/// The 60-bit secret, big-endian in 8 bytes.
+pub type RoomId = [u8; 8];
 
 pub fn generate() -> Result<(RoomId, String)> {
-    let id = random_bytes::<5>()?;
+    let v = u64::from_be_bytes(random_bytes::<8>()?) & ((1u64 << 60) - 1);
+    let id = v.to_be_bytes();
     Ok((id, encode(&id)))
 }
 
 pub fn encode(id: &RoomId) -> String {
-    let value = id.iter().fold(0u64, |acc, b| (acc << 8) | *b as u64);
-    let mut out = String::with_capacity(9);
-    for i in 0..8 {
-        if i == 4 {
+    let value = u64::from_be_bytes(*id);
+    let mut out = String::with_capacity(CODE_LEN + 2);
+    for i in 0..CODE_LEN {
+        if i > 0 && i % 4 == 0 {
             out.push('-');
         }
-        let shift = (7 - i) * 5;
+        let shift = (CODE_LEN - 1 - i) * 5;
         out.push(ALPHABET[((value >> shift) & 31) as usize] as char);
     }
     out
@@ -40,8 +47,8 @@ pub fn decode(code: &str) -> Result<RoomId> {
             c => c,
         })
         .collect();
-    if cleaned.len() != 8 {
-        bail!("room code must have 8 characters, got {}", cleaned.len());
+    if cleaned.len() != CODE_LEN {
+        bail!("room code must have {CODE_LEN} characters, got {}", cleaned.len());
     }
     let mut value = 0u64;
     for c in cleaned.bytes() {
@@ -51,15 +58,24 @@ pub fn decode(code: &str) -> Result<RoomId> {
             .ok_or_else(|| anyhow::anyhow!("`{}` is not a valid room-code character", c as char))?;
         value = (value << 5) | idx as u64;
     }
-    let mut id = [0u8; 5];
-    for (i, slot) in id.iter_mut().enumerate() {
-        *slot = ((value >> ((4 - i) * 8)) & 0xff) as u8;
-    }
-    Ok(id)
+    Ok(value.to_be_bytes())
 }
 
-pub fn hex(id: &RoomId) -> String {
-    id.iter().map(|b| format!("{b:02x}")).collect()
+/// Opaque topic id: the broker (and anyone listing topics) never sees the code.
+pub fn topic_id(id: &RoomId) -> String {
+    let mut h = Sha256::new();
+    h.update(b"pokertui-topic-v2");
+    h.update(id);
+    h.finalize()[..12].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Key that encrypts every packet in the room.
+pub fn room_key(id: &RoomId) -> [u8; 32] {
+    let mut okm = [0u8; 32];
+    Hkdf::<Sha256>::new(Some(b"pokertui-room-v2"), id)
+        .expand(b"packet-key", &mut okm)
+        .expect("32-byte hkdf output");
+    okm
 }
 
 #[cfg(test)]
@@ -70,7 +86,7 @@ mod tests {
     fn round_trip() {
         for _ in 0..64 {
             let (id, code) = generate().unwrap();
-            assert_eq!(code.len(), 9);
+            assert_eq!(code.len(), CODE_LEN + 2);
             assert_eq!(decode(&code).unwrap(), id);
             assert_eq!(decode(&code.to_lowercase()).unwrap(), id);
         }
@@ -87,6 +103,15 @@ mod tests {
     fn rejects_garbage() {
         assert!(decode("nope").is_err());
         assert!(decode("!!!!").is_err());
-        assert!(decode("00000000").is_ok());
+        assert!(decode("000000000000").is_ok());
+    }
+
+    #[test]
+    fn topic_and_key_do_not_reveal_the_code() {
+        let (a, _) = generate().unwrap();
+        let (b, _) = generate().unwrap();
+        assert_ne!(topic_id(&a), topic_id(&b));
+        assert_ne!(room_key(&a), room_key(&b));
+        assert!(!topic_id(&a).contains(&encode(&a).replace('-', "").to_lowercase()));
     }
 }

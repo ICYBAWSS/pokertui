@@ -8,6 +8,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use pokertui::app::{App, Mode};
+use pokertui::bot::Skill;
 use pokertui::menu::{Launch, Menu, MenuOut};
 use pokertui::game::{TableParams, verify_record};
 use pokertui::net::{ClientConfig, HostConfig, NetCommand, UiEvent, roomcode, run_client, run_host};
@@ -55,6 +56,15 @@ enum Cmd {
         /// Do not top busted players back up automatically
         #[arg(long)]
         no_rebuy: bool,
+        /// Seat computer players, e.g. --bots easy,medium,hard
+        #[arg(long, value_delimiter = ',')]
+        bots: Vec<String>,
+        /// Single-table tournament: blinds rise on a timer, last player wins
+        #[arg(long)]
+        sitngo: bool,
+        /// Let spectators see hole cards, this many seconds late (0 = off)
+        #[arg(long, default_value_t = 0)]
+        spectate_delay: u64,
     },
     /// Join a table by room code (skips the menu)
     Join {
@@ -73,11 +83,33 @@ enum Cmd {
     Replay { file: PathBuf },
     /// Print the embedded lobby art (handy for a README or MOTD)
     Art,
+    /// Sit back down at the table you were last at (after a crash or lost connection)
+    Rejoin,
+    /// Show your local rankings (everyone you have played with)
+    Rankings {
+        /// Forget all saved rankings
+        #[arg(long)]
+        reset: bool,
+        /// Show the global leaderboard instead (needs a configured relay)
+        #[arg(long)]
+        global: bool,
+    },
+    /// Opt in or out of the global leaderboard, and point at your relay
+    Leaderboard {
+        #[arg(value_parser = ["status", "on", "off", "show-state", "hide-state"], default_value = "status")]
+        action: String,
+        /// Relay address, e.g. cf+wss://pokertui-relay.you.workers.dev
+        #[arg(long)]
+        relay: Option<String>,
+        /// The relay's public key (printed by relay/cloudflare/scripts/gen-key.mjs)
+        #[arg(long)]
+        key: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let tui = !cli.plain && !matches!(cli.cmd, Some(Cmd::Verify { .. } | Cmd::Replay { .. } | Cmd::Art));
+    let tui = !cli.plain && !matches!(cli.cmd, Some(Cmd::Verify { .. } | Cmd::Replay { .. } | Cmd::Art | Cmd::Rankings { .. } | Cmd::Leaderboard { .. }));
     init_logging(tui);
 
     match &cli.cmd {
@@ -87,6 +119,8 @@ fn main() -> Result<()> {
             print!("{}", art::LOBBY);
             return Ok(());
         }
+        Some(Cmd::Rankings { reset, global }) => return rankings(*reset, *global),
+        Some(Cmd::Leaderboard { action, relay, key }) => return leaderboard_cmd(action, relay.clone(), key.clone()),
         _ => {}
     }
 
@@ -100,8 +134,19 @@ fn main() -> Result<()> {
         .context("building async runtime")?;
 
     let launch = match cli.cmd {
-        Some(Cmd::Host { name, seats, blinds, buyin, timer, no_rebuy }) => {
-            let (small_blind, big_blind) = parse_blinds(&blinds)?;
+        Some(Cmd::Host { name, seats, blinds, buyin, timer, no_rebuy, bots, sitngo, spectate_delay }) => {
+            let (mut small_blind, mut big_blind) = parse_blinds(&blinds)?;
+            let tourney = sitngo.then(pokertui::game::Tourney::standard);
+            if let Some(t) = &tourney {
+                (small_blind, big_blind) = t.levels[0];
+            }
+            let bots = bots
+                .iter()
+                .map(|b| Skill::parse(b).with_context(|| format!("unknown bot skill `{b}` (easy, medium, hard)")))
+                .collect::<Result<Vec<_>>>()?;
+            if bots.len() + 1 > seats {
+                bail!("--bots needs free seats: {} bots + you do not fit in {seats}", bots.len());
+            }
             if !(2..=9).contains(&seats) {
                 bail!("--seats must be between 2 and 9");
             }
@@ -113,8 +158,11 @@ fn main() -> Result<()> {
                     big_blind,
                     buyin,
                     turn_ms: timer.saturating_mul(1000),
+                    tourney,
                 },
                 auto_rebuy: !no_rebuy,
+                bots,
+                spectate_secs: spectate_delay,
             })
         }
         Some(Cmd::Join { code, name, buyin }) => {
@@ -125,10 +173,32 @@ fn main() -> Result<()> {
             roomcode::decode(&code)?;
             Some(Launch::Spectate { code })
         }
+        Some(Cmd::Rejoin) => {
+            let code = config.last_room.clone().context("no table to rejoin: join one first")?;
+            Some(Launch::Join { name: default_name.clone(), code, buyin: u64::MAX })
+        }
         _ => None,
     };
 
-    let session = Session { runtime: &runtime, identity, broker, show_art: !cli.no_art };
+    // Global leaderboard: only if a relay and its key are configured.
+    let outbox = match (&config.relay, &config.relay_key) {
+        (Some(relay), Some(key)) => {
+            let key = pokertui::leaderboard::server_key(key)?;
+            let dir = store::data_dir()?;
+            let cfg = pokertui::leaderboard::LbConfig {
+                relay: relay.clone(),
+                key,
+                identity: identity.clone(),
+                username: default_name.clone(),
+                listed: config.leaderboard,
+                show_state: config.show_state,
+            };
+            runtime.spawn(pokertui::leaderboard::uploader(dir.clone(), cfg));
+            Some((dir, key))
+        }
+        _ => None,
+    };
+    let session = Session { outbox, runtime: &runtime, identity, broker, show_art: !cli.no_art };
     let result = if cli.plain {
         let launch = launch.context("--plain needs a subcommand: host, join or spectate")?;
         let (app, rx) = session.start(launch)?;
@@ -160,6 +230,7 @@ fn init_logging(tui: bool) {
 }
 
 struct Session<'a> {
+    outbox: Option<(PathBuf, x25519_dalek::PublicKey)>,
     runtime: &'a tokio::runtime::Runtime,
     identity: Arc<pokertui::crypto::Identity>,
     broker: Option<String>,
@@ -173,17 +244,13 @@ impl Session<'_> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<NetCommand>();
         let tx = ui_tx.clone();
         let (mode, code) = match launch {
-            Launch::Host { name, params, auto_rebuy } => {
+            Launch::Host { name, params, auto_rebuy, bots, spectate_secs } => {
                 let (room, code) = roomcode::generate()?;
-                let cfg = HostConfig {
-                    identity: self.identity.clone(),
-                    code: code.clone(),
-                    room,
-                    name,
-                    params,
-                    broker: self.broker.clone(),
-                    auto_rebuy,
-                };
+                let mut cfg = HostConfig::new(self.identity.clone(), code.clone(), room, name, params);
+                cfg.broker = self.broker.clone();
+                cfg.auto_rebuy = auto_rebuy;
+                cfg.bots = bots;
+                cfg.spectate_secs = spectate_secs;
                 self.runtime.spawn(async move {
                     if let Err(e) = run_host(cfg, tx.clone(), cmd_rx).await {
                         let _ = tx.send(UiEvent::Closed(format!("host stopped: {e:#}")));
@@ -192,15 +259,14 @@ impl Session<'_> {
                 (Mode::Host, code)
             }
             Launch::Join { name, code, buyin } => {
-                let cfg = ClientConfig {
-                    identity: self.identity.clone(),
-                    code: code.clone(),
-                    room: roomcode::decode(&code)?,
+                let mut cfg = ClientConfig::new(
+                    self.identity.clone(),
+                    code.clone(),
+                    roomcode::decode(&code)?,
                     name,
                     buyin,
-                    broker: self.broker.clone(),
-                    spectate: false,
-                };
+                );
+                cfg.broker = self.broker.clone();
                 self.runtime.spawn(async move {
                     if let Err(e) = run_client(cfg, tx.clone(), cmd_rx).await {
                         let _ = tx.send(UiEvent::Closed(format!("could not join: {e:#}")));
@@ -209,15 +275,15 @@ impl Session<'_> {
                 (Mode::Client, code)
             }
             Launch::Spectate { code } => {
-                let cfg = ClientConfig {
-                    identity: self.identity.clone(),
-                    code: code.clone(),
-                    room: roomcode::decode(&code)?,
-                    name: "spectator".into(),
-                    buyin: 0,
-                    broker: self.broker.clone(),
-                    spectate: true,
-                };
+                let mut cfg = ClientConfig::new(
+                    self.identity.clone(),
+                    code.clone(),
+                    roomcode::decode(&code)?,
+                    "spectator".into(),
+                    0,
+                );
+                cfg.broker = self.broker.clone();
+                cfg.spectate = true;
                 self.runtime.spawn(async move {
                     if let Err(e) = run_client(cfg, tx.clone(), cmd_rx).await {
                         let _ = tx.send(UiEvent::Closed(format!("could not watch: {e:#}")));
@@ -226,7 +292,9 @@ impl Session<'_> {
                 (Mode::Spectator, code)
             }
         };
-        let app = App::new(mode, code, broker_display(&self.broker), cmd_tx, self.show_art);
+        let mut app = App::new(mode, code, broker_display(&self.broker), cmd_tx, self.show_art);
+        app.stats = Some(pokertui::rank::Rankings::load());
+        app.outbox = self.outbox.clone();
         Ok((app, ui_rx))
     }
 }
@@ -247,6 +315,72 @@ fn parse_blinds(text: &str) -> Result<(u64, u64)> {
         bail!("blinds must be positive with big blind >= small blind");
     }
     Ok((small, big))
+}
+
+fn leaderboard_cmd(action: &str, relay: Option<String>, key: Option<String>) -> Result<()> {
+    let mut config = store::Config::load();
+    if let Some(k) = &key {
+        pokertui::leaderboard::server_key(k)?;
+    }
+    config.relay = relay.or(config.relay);
+    config.relay_key = key.or(config.relay_key);
+    match action {
+        "on" => config.leaderboard = true,
+        "off" => config.leaderboard = false,
+        "show-state" => config.show_state = true,
+        "hide-state" => config.show_state = false,
+        _ => {}
+    }
+    store::save_config(&config)?;
+    println!("username:     {}", config.name.clone().unwrap_or_else(store::default_name));
+    println!("relay:        {}", config.relay.as_deref().unwrap_or("(not set: --relay and --key)"));
+    println!("on the board: {}", if config.leaderboard { "yes" } else { "no (opt in with `poker leaderboard on`)" });
+    println!("show state:   {}", if config.show_state { "yes (guessed from your connection)" } else { "no" });
+    if let Some(status) = pokertui::leaderboard::Outbox::load_from(&store::data_dir()?).status(pokertui::net::protocol::now_ms()) {
+        println!("queue:        {status}");
+    }
+    Ok(())
+}
+
+fn rankings(reset: bool, global: bool) -> Result<()> {
+    if global {
+        let config = store::Config::load();
+        let relay = config.relay.context("no relay configured: poker leaderboard --relay URL --key KEY")?;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let board = rt.block_on(pokertui::leaderboard::fetch_board(
+            &store::data_dir()?,
+            &relay,
+            pokertui::net::protocol::now_ms(),
+        ))?;
+        println!("{:<5} {:<18} state", "rank", "username");
+        for r in board.rows {
+            println!("{:<5} {:<18} {}", r.rank, r.username, r.state.unwrap_or_else(|| "-".into()));
+        }
+        return Ok(());
+    }
+    if reset {
+        pokertui::rank::Rankings::default().save();
+        println!("rankings cleared");
+        return Ok(());
+    }
+    let r = pokertui::rank::Rankings::load();
+    if r.players.is_empty() {
+        println!("no rankings yet: play a few hands");
+        return Ok(());
+    }
+    println!("{:<3} {:<16} {:>6} {:>5} {:>9} {:>4}", "#", "player", "hands", "win%", "net BB", "pts");
+    for (i, (_, s)) in r.sorted().iter().enumerate() {
+        println!(
+            "{:<3} {:<16} {:>6} {:>4.0}% {:>+9.1} {:>4}",
+            i + 1,
+            s.name,
+            s.hands,
+            s.win_pct(),
+            s.net_bb,
+            s.tourney_points
+        );
+    }
+    Ok(())
 }
 
 fn verify(file: &PathBuf) -> Result<()> {
@@ -324,6 +458,7 @@ fn run_tui(session: &Session, mut pending: Option<Launch>, config: store::Config
                     None => return Ok(()),
                 },
             };
+            let seated = !matches!(launch, Launch::Spectate { .. });
             let (app, rx) = match session.start(launch) {
                 Ok(started) => started,
                 Err(e) => {
@@ -331,7 +466,16 @@ fn run_tui(session: &Session, mut pending: Option<Launch>, config: store::Config
                     continue;
                 }
             };
-            match run_table(&mut terminal, app, rx)? {
+            // Remember the table so a crash can be undone with "Rejoin".
+            if seated {
+                menu.config.last_room = Some(app.code.clone());
+                let _ = store::save_config(&menu.config);
+            }
+            let exit = run_table(&mut terminal, app, rx)?;
+            // Leaving on purpose frees the seat, so there is nothing to rejoin.
+            menu.config.last_room = None;
+            let _ = store::save_config(&menu.config);
+            match exit {
                 TableExit::Quit => return Ok(()),
                 TableExit::Menu(reason) => menu.back_to_main(reason),
             }

@@ -1542,11 +1542,14 @@ name = "pokertui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-tungstenite",
  "base64",
  "chacha20poly1305",
  "clap",
+ "curve25519-dalek",
  "directories",
  "ed25519-dalek",
+ "futures-util",
  "getrandom 0.3.4",
  "hkdf",
  "rand_chacha 0.10.0",

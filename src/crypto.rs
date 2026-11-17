@@ -83,6 +83,11 @@ impl Identity {
         B64.encode(self.signing.verifying_key().to_bytes())
     }
 
+    /// Raw X25519 secret, for tooling that needs to open sealed payloads (tests, fixtures).
+    pub fn enc_secret_b64(&self) -> String {
+        B64.encode(self.enc.to_bytes())
+    }
+
     pub fn enc_pub_b64(&self) -> String {
         B64.encode(self.enc_pub().as_bytes())
     }
@@ -175,6 +180,50 @@ pub fn open_sealed(secret: &StaticSecret, sealed: &Sealed) -> Result<Vec<u8>> {
         .map_err(|_| anyhow::anyhow!("decryption failed (wrong recipient or tampered payload)"))
 }
 
+/// Encrypt a whole packet under the room key (nonce || ciphertext).
+pub fn box_up(key: &[u8; 32], plain: &[u8]) -> Result<Vec<u8>> {
+    let cipher = ChaCha20Poly1305::new_from_slice(key).expect("32-byte key");
+    let nonce = random_bytes::<12>()?;
+    let ct = cipher
+        .encrypt(&Nonce::from(nonce), plain)
+        .map_err(|_| anyhow::anyhow!("encryption failed"))?;
+    let mut out = nonce.to_vec();
+    out.extend(ct);
+    Ok(out)
+}
+
+pub fn box_open(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 12 + 16 {
+        anyhow::bail!("packet too short");
+    }
+    let cipher = ChaCha20Poly1305::new_from_slice(key).expect("32-byte key");
+    let nonce: [u8; 12] = data[..12].try_into().expect("12 bytes");
+    cipher
+        .decrypt(&Nonce::from(nonce), &data[12..])
+        .map_err(|_| anyhow::anyhow!("packet not encrypted for this room"))
+}
+
+/// Public commitment to the host's secret for the next shuffle.
+pub fn seed_commit(host_secret: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"pokertui-seedc-v1");
+    h.update(host_secret);
+    h.finalize().into()
+}
+
+/// Deck seed = hash of the host secret and every player's contribution
+/// (callers pass contributions sorted by seat).
+pub fn mix_seed(host_secret: &[u8; 32], contribs: &[(usize, [u8; 32])]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"pokertui-seed-v1");
+    h.update(host_secret);
+    for (seat, r) in contribs {
+        h.update([*seat as u8]);
+        h.update(r);
+    }
+    h.finalize().into()
+}
+
 pub const DECK_DOMAIN: &[u8] = b"pokertui-deck-v1";
 
 pub fn deck_commit(nonce: &[u8; 16], deck: &[u8]) -> [u8; 32] {
@@ -225,6 +274,14 @@ mod tests {
         let same = Identity::from_seed_b64(&id.seed_b64()).unwrap();
         assert_eq!(id.pubkey_b64(), same.pubkey_b64());
         assert_eq!(id.enc_pub_b64(), same.enc_pub_b64());
+    }
+
+    #[test]
+    fn room_box_round_trip_and_wrong_key() {
+        let k = [7u8; 32];
+        let ct = box_up(&k, b"hello").unwrap();
+        assert_eq!(box_open(&k, &ct).unwrap(), b"hello");
+        assert!(box_open(&[8u8; 32], &ct).is_err());
     }
 
     #[test]

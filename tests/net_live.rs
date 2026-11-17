@@ -108,6 +108,7 @@ async fn host_and_two_clients_play_a_hand() {
         big_blind: 50,
         buyin: 2_000,
         turn_ms: 20_000,
+        tourney: None,
     };
 
     let host_id = Arc::new(Identity::generate().unwrap());
@@ -122,45 +123,16 @@ async fn host_and_two_clients_play_a_hand() {
     let (a_cmd_tx, a_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (b_cmd_tx, b_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    tokio::spawn(run_host(
-        HostConfig {
-            identity: host_id,
-            code: code.clone(),
-            room,
-            name: "host".into(),
-            params,
-            broker: broker.clone(),
-            auto_rebuy: true,
-        },
-        host_tx,
-        host_cmd_rx,
-    ));
-    tokio::spawn(run_client(
-        ClientConfig {
-            identity: a_id,
-            code: code.clone(),
-            room,
-            name: "alice".into(),
-            buyin: 2_000,
-            broker: broker.clone(),
-            spectate: false,
-        },
-        a_tx,
-        a_cmd_rx,
-    ));
-    tokio::spawn(run_client(
-        ClientConfig {
-            identity: b_id,
-            code: code.clone(),
-            room,
-            name: "bob".into(),
-            buyin: 2_000,
-            broker: broker.clone(),
-            spectate: false,
-        },
-        b_tx,
-        b_cmd_rx,
-    ));
+    let mut host_cfg = HostConfig::new(host_id, code.clone(), room, "host".into(), params);
+    host_cfg.broker = broker.clone();
+    host_cfg.persist = false;
+    let mut a_cfg = ClientConfig::new(a_id, code.clone(), room, "alice".into(), 2_000);
+    a_cfg.broker = broker.clone();
+    let mut b_cfg = ClientConfig::new(b_id, code.clone(), room, "bob".into(), 2_000);
+    b_cfg.broker = broker.clone();
+    tokio::spawn(run_host(host_cfg, host_tx, host_cmd_rx));
+    tokio::spawn(run_client(a_cfg, a_tx, a_cmd_rx));
+    tokio::spawn(run_client(b_cfg, b_tx, b_cmd_rx));
 
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     spawn_bot(

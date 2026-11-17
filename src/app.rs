@@ -104,6 +104,15 @@ pub struct App {
     pub anim: Anim,
     /// Ring the terminal bell: your turn just started.
     pub bell: bool,
+    /// Host kick/ban picker: `Some(ban)` while waiting for a seat number.
+    pub kick_mode: Option<bool>,
+    bot_next: crate::bot::Skill,
+    /// Local rankings, updated after every hand (None disables recording).
+    pub stats: Option<crate::rank::Rankings>,
+    stats_seen: Option<u32>,
+    tourney_recorded: bool,
+    /// Where co-signed hands are queued for the global leaderboard, and the relay's key.
+    pub outbox: Option<(std::path::PathBuf, x25519_dalek::PublicKey)>,
 }
 
 impl App {
@@ -142,6 +151,12 @@ impl App {
             raise: None,
             anim: Anim::default(),
             bell: false,
+            kick_mode: None,
+            bot_next: crate::bot::Skill::Easy,
+            stats: None,
+            stats_seen: None,
+            tourney_recorded: false,
+            outbox: None,
         }
     }
 
@@ -184,6 +199,15 @@ impl App {
                 self.push_log(LogKind::Chat, format!("{from}: {text}"));
             }
             UiEvent::Info(text) => self.push_log(LogKind::Info, text),
+            UiEvent::Promoted => self.mode = Mode::Host,
+            UiEvent::Bundle(bundle) => {
+                if let Some((dir, key)) = &self.outbox {
+                    let now = now_ms();
+                    crate::leaderboard::with_outbox(dir, |ob| {
+                        let _ = ob.push(&bundle, key, now);
+                    });
+                }
+            }
             UiEvent::Error(text) => {
                 self.push_log(LogKind::Error, text.clone());
                 self.set_notice(text);
@@ -202,6 +226,37 @@ impl App {
         if !view.message.is_empty() && view.message != self.last_message {
             self.last_message = view.message.clone();
             self.push_log(LogKind::Action, view.message.clone());
+        }
+        if let Some(result) = &view.last_result
+            && self.stats_seen != Some(result.hand_no)
+        {
+            self.stats_seen = Some(result.hand_no);
+            if self.mode != Mode::Spectator
+                && let Some(stats) = self.stats.as_mut()
+            {
+                stats.record_hand(&view);
+                stats.save();
+            }
+        }
+        if let Some(t) = &view.tourney
+            && t.over
+            && !self.tourney_recorded
+        {
+            self.tourney_recorded = true;
+            if self.mode != Mode::Spectator
+                && let Some(stats) = self.stats.as_mut()
+            {
+                stats.record_tourney(&view);
+                stats.save();
+            }
+            let standings = t
+                .places
+                .iter()
+                .map(|(_, name, place)| format!("{place}. {name}"))
+                .collect::<Vec<_>>()
+                .join("  ");
+            self.push_log(LogKind::Info, format!("tournament over: {standings}"));
+            self.set_notice("tournament over");
         }
         if let Some(result) = &view.last_result
             && self.result_seen != Some(result.hand_no)
@@ -500,7 +555,32 @@ impl App {
             }
             return true;
         }
+        if let Some(ban) = self.kick_mode {
+            self.kick_mode = None;
+            if let KeyCode::Char(c @ '1'..='9') = key.code {
+                let _ = self.net.send(NetCommand::Kick { seat: c as usize - '1' as usize, ban });
+            } else {
+                self.set_notice("cancelled");
+            }
+            return true;
+        }
         match key.code {
+            KeyCode::Char('+') if self.mode == Mode::Host => {
+                let skill = self.bot_next;
+                self.bot_next = skill.cycle();
+                let _ = self.net.send(NetCommand::AddBot(skill));
+            }
+            KeyCode::Char(c @ ('k' | 'K')) if self.mode == Mode::Host => {
+                self.kick_mode = Some(c == 'K');
+                self.set_notice(format!(
+                    "{} which seat? press 1-9 (anything else cancels)",
+                    if c == 'K' { "ban" } else { "remove" }
+                ));
+            }
+            KeyCode::Char('i') | KeyCode::Char('I') if self.mode != Mode::Spectator => {
+                let _ = self.net.send(NetCommand::Ready(true));
+                self.set_notice("sitting back in");
+            }
             KeyCode::Esc | KeyCode::Char('q') => self.confirm_leave = true,
             KeyCode::Char('1') | KeyCode::Char('f') => self.send(Move::Fold),
             KeyCode::Char('2') => {

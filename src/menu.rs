@@ -3,6 +3,7 @@
 
 use crate::anim;
 use crate::art;
+use crate::bot::Skill;
 use crate::game::TableParams;
 use crate::net::roomcode;
 use crate::store::{self, Config};
@@ -22,6 +23,8 @@ pub enum Launch {
         name: String,
         params: TableParams,
         auto_rebuy: bool,
+        bots: Vec<Skill>,
+        spectate_secs: u64,
     },
     Join {
         name: String,
@@ -60,6 +63,7 @@ impl Settings {
             big_blind: self.bb,
             buyin: self.stack,
             turn_ms: self.timer_s * 1000,
+            tourney: None,
         }
     }
 
@@ -181,6 +185,19 @@ pub enum Screen {
     Settings,
     JoinCode,
     WatchCode,
+    Rankings,
+}
+
+/// Entries on the main menu, in display order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MainItem {
+    Rejoin(String),
+    Host,
+    Join,
+    Watch,
+    Rankings,
+    Username,
+    Quit,
 }
 
 pub struct Menu {
@@ -198,6 +215,11 @@ pub struct Menu {
     pub notice: Option<String>,
     pub show_art: bool,
     pub config: Config,
+    pub rankings: crate::rank::Rankings,
+    /// 0 = people you've played, 1 = the global board.
+    pub rank_tab: usize,
+    pub global: Option<crate::leaderboard::Board>,
+    pub lb_status: Option<String>,
 }
 
 impl Menu {
@@ -217,7 +239,20 @@ impl Menu {
             notice: None,
             show_art,
             config,
+            rankings: crate::rank::Rankings::default(),
+            rank_tab: 0,
+            global: None,
+            lb_status: None,
         }
+    }
+
+    pub fn main_items(&self) -> Vec<MainItem> {
+        let mut items = Vec::new();
+        if let Some(code) = &self.config.last_room {
+            items.push(MainItem::Rejoin(code.clone()));
+        }
+        items.extend([MainItem::Host, MainItem::Join, MainItem::Watch, MainItem::Rankings, MainItem::Username, MainItem::Quit]);
+        items
     }
 
     pub fn name(&self) -> String {
@@ -252,11 +287,33 @@ impl Menu {
             .unwrap_or(PRESETS[0].settings)
     }
 
+    /// Six-handed single-table tournament: equal stacks, blinds rise on a timer.
+    fn host_sit_and_go(&mut self) -> Option<MenuOut> {
+        let t = crate::game::Tourney::standard();
+        let (small_blind, big_blind) = t.levels[0];
+        Some(MenuOut::Launch(Launch::Host {
+            name: self.name(),
+            params: TableParams {
+                max_seats: 6,
+                small_blind,
+                big_blind,
+                buyin: 3_000,
+                turn_ms: 30_000,
+                tourney: Some(t),
+            },
+            auto_rebuy: false,
+            bots: Vec::new(),
+            spectate_secs: 0,
+        }))
+    }
+
     fn host(&mut self, s: Settings) -> Option<MenuOut> {
         Some(MenuOut::Launch(Launch::Host {
             name: self.name(),
             params: s.params(),
             auto_rebuy: s.rebuy,
+            bots: Vec::new(),
+            spectate_secs: 0,
         }))
     }
 
@@ -281,6 +338,14 @@ impl Menu {
             Screen::GameType => self.key_game_type(key),
             Screen::Settings => self.key_settings(key),
             Screen::JoinCode | Screen::WatchCode => self.key_code(key),
+            Screen::Rankings => {
+                match key.code {
+                    KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.rank_tab = 1 - self.rank_tab,
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.go(Screen::Main),
+                    _ => {}
+                }
+                None
+            }
         }
     }
 
@@ -288,8 +353,8 @@ impl Menu {
         match key.code {
             KeyCode::Enter => {
                 let name = self.input.trim().to_string();
-                if name.is_empty() {
-                    self.hint = Some("type a name first".into());
+                if name.chars().count() < 3 {
+                    self.hint = Some("use at least 3 characters".into());
                 } else {
                     self.config.name = Some(name);
                     let _ = store::save_config(&self.config);
@@ -301,7 +366,7 @@ impl Menu {
                 self.input.pop();
             }
             KeyCode::Char(c)
-                if (c.is_alphanumeric() || " _-.".contains(c)) && self.input.chars().count() < 16 =>
+                if (c.is_ascii_alphanumeric() || c == '_' || c == '-') && self.input.chars().count() < 16 =>
             {
                 self.input.push(c);
             }
@@ -311,34 +376,62 @@ impl Menu {
     }
 
     fn key_main(&mut self, key: KeyEvent) -> Option<MenuOut> {
-        const ITEMS: usize = 5;
+        let items = self.main_items();
+        let n = items.len();
+        let numbered = |c: char| -> Option<MainItem> {
+            let want = match c {
+                '1' => MainItem::Host,
+                '2' => MainItem::Join,
+                '3' => MainItem::Watch,
+                '4' => MainItem::Rankings,
+                '5' => MainItem::Username,
+                _ => return None,
+            };
+            items.iter().find(|i| **i == want).cloned()
+        };
         let pick = match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                self.sel = (self.sel + ITEMS - 1) % ITEMS;
+                self.sel = (self.sel + n - 1) % n;
                 None
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.sel = (self.sel + 1) % ITEMS;
+                self.sel = (self.sel + 1) % n;
                 None
             }
-            KeyCode::Enter => Some(self.sel),
-            KeyCode::Char(c @ '1'..='4') => Some(c as usize - '1' as usize),
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => Some(4),
+            KeyCode::Enter => items.get(self.sel).cloned(),
+            KeyCode::Char(c @ '1'..='5') => numbered(c),
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                items.iter().find(|i| matches!(i, MainItem::Rejoin(_))).cloned()
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => Some(MainItem::Quit),
             _ => None,
         };
         match pick {
-            Some(0) => self.go(Screen::GameType),
-            Some(1) => self.go(Screen::JoinCode),
-            Some(2) => self.go(Screen::WatchCode),
-            Some(3) => self.go(Screen::Name),
-            Some(4) => return Some(MenuOut::Quit),
-            _ => {}
+            Some(MainItem::Rejoin(code)) => {
+                return Some(MenuOut::Launch(Launch::Join { name: self.name(), code, buyin: u64::MAX }));
+            }
+            Some(MainItem::Host) => self.go(Screen::GameType),
+            Some(MainItem::Join) => self.go(Screen::JoinCode),
+            Some(MainItem::Watch) => self.go(Screen::WatchCode),
+            Some(MainItem::Rankings) => {
+                self.rankings = crate::rank::Rankings::load();
+                if let Ok(dir) = store::data_dir() {
+                    self.global = crate::leaderboard::cached_board(&dir);
+                    self.lb_status = crate::leaderboard::Outbox::load_from(&dir)
+                        .status(crate::net::protocol::now_ms());
+                }
+                self.rank_tab = 0;
+                self.go(Screen::Rankings);
+            }
+            Some(MainItem::Username) => self.go(Screen::Name),
+            Some(MainItem::Quit) => return Some(MenuOut::Quit),
+            None => {}
         }
         None
     }
 
     fn key_game_type(&mut self, key: KeyEvent) -> Option<MenuOut> {
-        let items = PRESETS.len() + 1; // + Custom
+        let items = PRESETS.len() + 2; // + Sit & Go + Custom
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.sel = (self.sel + items - 1) % items,
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.sel = (self.sel + 1) % items,
@@ -348,13 +441,16 @@ impl Menu {
                 self.go(Screen::Settings);
                 self.settings = s;
             }
-            KeyCode::Enter | KeyCode::Char('1'..='5') => {
+            KeyCode::Enter | KeyCode::Char('1'..='6') => {
                 let idx = match key.code {
                     KeyCode::Char(c) => c as usize - '1' as usize,
                     _ => self.sel,
                 };
                 if let Some(p) = PRESETS.get(idx) {
                     return self.host(p.settings);
+                }
+                if idx == PRESETS.len() {
+                    return self.host_sit_and_go();
                 }
                 let s = self.saved_custom();
                 self.go(Screen::Settings);
@@ -467,13 +563,13 @@ impl Menu {
                 self.input.pop();
                 self.hint = None;
             }
-            KeyCode::Char(c) if c.is_ascii_alphanumeric() && self.input.len() < 8 => {
+            KeyCode::Char(c) if c.is_ascii_alphanumeric() && self.input.len() < roomcode::CODE_LEN => {
                 self.input.push(c.to_ascii_uppercase());
                 self.hint = None;
             }
             KeyCode::Enter => match roomcode::decode(&self.input) {
                 Ok(_) => {
-                    let code = format!("{}-{}", &self.input[..4], &self.input[4..]);
+                    let code = format!("{}-{}-{}", &self.input[..4], &self.input[4..8], &self.input[8..]);
                     return Some(MenuOut::Launch(if self.screen == Screen::JoinCode {
                         // The host clamps the buy-in to its table's starting stack.
                         Launch::Join { name: self.name(), code, buyin: u64::MAX }
@@ -527,6 +623,7 @@ pub fn draw(f: &mut Frame, m: &Menu) {
         Screen::GameType => game_type_panel(m),
         Screen::Settings => settings_panel(m),
         Screen::JoinCode | Screen::WatchCode => code_panel(m),
+        Screen::Rankings => rankings_panel(m),
         Screen::Splash => unreachable!(),
     };
     // Panels slide up a couple of rows when they open.
@@ -694,24 +791,106 @@ fn name_panel(m: &Menu) -> Panel {
     if let Some(h) = &m.hint {
         lines.push(Line::from(Span::styled(format!("  {h}"), Style::default().fg(RED))));
     }
-    ("YOUR NAME", lines, "Enter save · Esc back")
+    lines.push(Line::from(Span::styled(
+        "   Shown on the public leaderboard.",
+        Style::default().fg(DIM),
+    )));
+    lines.push(Line::from(Span::styled(
+        "   Don't use your real name.",
+        Style::default().fg(DIM),
+    )));
+    lines.push(Line::from(""));
+    ("YOUR USERNAME", lines, "letters, numbers, _ and - · Enter save · Esc back")
 }
 
 fn main_panel(m: &Menu) -> Panel {
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("  playing as ", Style::default().fg(DIM)),
             Span::styled(m.name(), Style::default().fg(YOU).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(""),
-        item(m, 0, "1", "Host a table", ""),
-        item(m, 1, "2", "Join a table", ""),
-        item(m, 2, "3", "Watch a table", ""),
-        item(m, 3, "4", "Change name", ""),
-        item(m, 4, "Q", "Quit", ""),
-        Line::from(""),
     ];
+    let mut n = 0;
+    for (i, it) in m.main_items().iter().enumerate() {
+        let (key, label, detail) = match it {
+            MainItem::Rejoin(code) => ("R".to_string(), "Rejoin your table".to_string(), code.clone()),
+            MainItem::Host => { n += 1; (n.to_string(), "Host a table".into(), String::new()) }
+            MainItem::Join => { n += 1; (n.to_string(), "Join a table".into(), String::new()) }
+            MainItem::Watch => { n += 1; (n.to_string(), "Watch a table".into(), String::new()) }
+            MainItem::Rankings => { n += 1; (n.to_string(), "Rankings".into(), String::new()) }
+            MainItem::Username => { n += 1; (n.to_string(), "Change username".into(), String::new()) }
+            MainItem::Quit => ("Q".to_string(), "Quit".into(), String::new()),
+        };
+        lines.push(item(m, i, &key, &label, &detail));
+    }
+    lines.push(Line::from(""));
     ("MAIN MENU", lines, "↑↓ · Enter")
+}
+
+fn global_panel(m: &Menu) -> Panel {
+    let mut lines = vec![Line::from(Span::styled(
+        format!("  {:<5} {:<18} {}", "rank", "username", "state"),
+        Style::default().fg(DIM),
+    ))];
+    match &m.global {
+        Some(board) if !board.rows.is_empty() => {
+            for r in board.rows.iter().take(12) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {:<5} {:<18} {}", r.rank, truncate_name(&r.username, 18), r.state.clone().unwrap_or_else(|| "—".into())),
+                    Style::default().fg(TEXT),
+                )));
+            }
+        }
+        Some(_) => lines.push(Line::from(Span::styled("  Nobody has 50 hands yet.", Style::default().fg(DIM)))),
+        None => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  Not loaded. Run: poker rankings --global", Style::default().fg(DIM))));
+        }
+    }
+    if let Some(s) = &m.lb_status {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(format!("  {s}"), Style::default().fg(GOLD))));
+    }
+    lines.push(Line::from(""));
+    ("RANKINGS · everyone", lines, "Tab switch · Esc back")
+}
+
+fn rankings_panel(m: &Menu) -> Panel {
+    if m.rank_tab == 1 {
+        return global_panel(m);
+    }
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("  {:<3} {:<16} {:>6} {:>5} {:>8} {:>4}", "#", "player", "hands", "win%", "net BB", "pts"),
+            Style::default().fg(DIM),
+        )),
+    ];
+    let rows = m.rankings.sorted();
+    if rows.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  Nobody yet. Play a few hands.", Style::default().fg(DIM))));
+    }
+    for (i, (_, s)) in rows.iter().take(12).enumerate() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {:<3} {:<16} {:>6} {:>4.0}% {:>+8.1} {:>4}",
+                i + 1,
+                truncate_name(&s.name, 16),
+                s.hands,
+                s.win_pct(),
+                s.net_bb,
+                s.tourney_points
+            ),
+            Style::default().fg(TEXT),
+        )));
+    }
+    lines.push(Line::from(""));
+    ("RANKINGS · people you've played", lines, "Tab for everyone · Esc back")
+}
+
+fn truncate_name(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
 }
 
 fn game_type_panel(m: &Menu) -> Panel {
@@ -719,8 +898,9 @@ fn game_type_panel(m: &Menu) -> Panel {
     for (i, p) in PRESETS.iter().enumerate() {
         lines.push(item(m, i, &(i + 1).to_string(), p.name, &p.settings.summary()));
     }
-    let custom = PRESETS.len();
-    lines.push(item(m, custom, "5", "Custom", ""));
+    let sng = PRESETS.len();
+    lines.push(item(m, sng, "5", "Sit & Go", "3,000 stacks · blinds rise every 5 min"));
+    lines.push(item(m, sng + 1, "6", "Custom", ""));
     lines.push(Line::from(""));
     ("CHOOSE A GAME", lines, "Enter create · E edit · Esc back")
 }
@@ -771,8 +951,8 @@ fn settings_panel(m: &Menu) -> Panel {
 
 fn code_panel(m: &Menu) -> Panel {
     let mut slots = Vec::new();
-    for i in 0..8 {
-        if i == 4 {
+    for i in 0..roomcode::CODE_LEN {
+        if i > 0 && i % 4 == 0 {
             slots.push(Span::styled(" ─ ", Style::default().fg(DIM)));
         }
         let ch = m.input.chars().nth(i);
@@ -889,13 +1069,13 @@ mod tests {
         }
         assert!(m.handle_key(key(KeyCode::Enter)).is_none());
         assert!(m.hint.is_some(), "short code rejected");
-        for c in "9xzp!".chars() {
+        for c in "9xzp4m8t!".chars() {
             m.handle_key(key(KeyCode::Char(c)));
         }
-        assert_eq!(m.input, "K7Q29XZP");
+        assert_eq!(m.input, "K7Q29XZP4M8T");
         match m.handle_key(key(KeyCode::Enter)) {
             Some(MenuOut::Launch(Launch::Join { code, buyin, .. })) => {
-                assert_eq!(code, "K7Q2-9XZP");
+                assert_eq!(code, "K7Q2-9XZP-4M8T");
                 assert_eq!(buyin, u64::MAX);
             }
             _ => panic!("expected a join launch"),

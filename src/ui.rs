@@ -239,9 +239,8 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App, view: &TableView) {
             format!(" {} ", street_label(view).to_uppercase()),
             Style::default().fg(GOLD),
         ));
-    if !my_turn {
-        block = block.title(Line::from(Span::styled(format!(" {}/{} ", chips(view.small_blind), chips(view.big_blind)), Style::default().fg(DIM))).right_aligned());
-    } else {
+    block = block.title(Line::from(Span::styled(blinds_label(view), Style::default().fg(DIM))).right_aligned());
+    if my_turn {
         block = block.title(
             Line::from(Span::styled(" >> YOUR TURN << ", Style::default().fg(Color::Black).bg(border).add_modifier(Modifier::BOLD))).centered(),
         );
@@ -378,6 +377,39 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App, view: &TableView) {
     }
 }
 
+/// Blinds, or the tournament level and countdown to the next one.
+fn blinds_label(view: &TableView) -> String {
+    let blinds = format!("{}/{}", chips(view.small_blind), chips(view.big_blind));
+    let Some(t) = &view.tourney else {
+        return format!(" {blinds} ");
+    };
+    if t.over {
+        return " TOURNAMENT OVER ".into();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let next = if t.next_level_at_ms > now {
+        let s = (t.next_level_at_ms - now) / 1000;
+        format!(" · next {}:{:02}", s / 60, s % 60)
+    } else {
+        String::new()
+    };
+    format!(" L{} · {blinds}{next} ", t.level + 1)
+}
+
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
 fn draw_seat(buf: &mut Buffer, rect: Rect, app: &App, view: &TableView, seat: usize, cards_landed: usize) {
     let s = &view.seats[seat];
     let is_actor = view.actor == Some(seat) && view.phase == Phase::Betting;
@@ -414,8 +446,14 @@ fn draw_seat(buf: &mut Buffer, rect: Rect, app: &App, view: &TableView, seat: us
         block = block.title(Line::from(Span::styled(" D ", Style::default().fg(Color::Black).bg(Color::Rgb(235, 235, 228)).add_modifier(Modifier::BOLD))).right_aligned());
     }
 
-    let (status, status_fg) = if !s.connected {
+    let (status, status_fg) = if let Some(p) = s.place.filter(|_| s.stack == 0) {
+        (format!("out · {}", ordinal(p)), DIM)
+    } else if s.place == Some(1) {
+        ("WINNER".to_string(), GOLD)
+    } else if !s.connected {
         ("away".to_string(), DIM)
+    } else if s.sitting_out {
+        ("sitting out".to_string(), DIM)
     } else if s.folded {
         ("folded".to_string(), DIM)
     } else if s.all_in {
@@ -437,9 +475,12 @@ fn draw_seat(buf: &mut Buffer, rect: Rect, app: &App, view: &TableView, seat: us
         .as_ref()
         .filter(|_| view.phase == Phase::HandOver)
         .and_then(|r| r.reveals.iter().find(|r| r.seat == seat));
-    if let Some(r) = reveal {
+    let shown: Option<&[Card]> = reveal
+        .map(|r| r.cards.as_slice())
+        .or_else(|| (!s.reveal.is_empty()).then_some(s.reveal.as_slice()));
+    if let Some(cards) = shown {
         let mut spans = vec![Span::raw(" ")];
-        for c in &r.cards {
+        for c in cards {
             spans.push(Span::styled(
                 format!("{}{}", rank_str(*c), c.suit_symbol()),
                 Style::default().fg(if c.is_red() { Color::Rgb(200, 30, 40) } else { Color::Black }).bg(Color::Rgb(240, 240, 232)).add_modifier(Modifier::BOLD),
@@ -892,6 +933,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         row("3  r", "raise"),
         row("4  a", "all-in"),
         row("Enter", "deal (host)"),
+        row("+", "add a bot (host)"),
+        row("k  K", "kick / ban (host)"),
+        row("i", "sit back in"),
         row("t  /", "chat"),
         row("Esc  q", "leave"),
         Line::from(""),
@@ -945,7 +989,7 @@ mod tests {
 
     /// An App seated at a real 3-handed table, on the clock.
     fn app_on_turn() -> (App, tokio::sync::mpsc::UnboundedReceiver<NetCommand>) {
-        let mut table = Table::new(TableParams { max_seats: 6, small_blind: 25, big_blind: 50, buyin: 5_000, turn_ms: 30_000 });
+        let mut table = Table::new(TableParams { max_seats: 6, small_blind: 25, big_blind: 50, buyin: 5_000, turn_ms: 30_000, tourney: None });
         for name in ["alice", "bob", "carol"] {
             let seat = table.join(name, &format!("pk-{name}"), "enc", 5_000).unwrap();
             table.set_ready(seat, true);
@@ -984,7 +1028,7 @@ mod tests {
     #[test]
     fn full_hand_only_the_actor_sees_controls() {
         let names = ["alice", "bob", "carol"];
-        let mut table = Table::new(TableParams { max_seats: 6, small_blind: 25, big_blind: 50, buyin: 5_000, turn_ms: 30_000 });
+        let mut table = Table::new(TableParams { max_seats: 6, small_blind: 25, big_blind: 50, buyin: 5_000, turn_ms: 30_000, tourney: None });
         for name in names {
             let seat = table.join(name, &format!("pk-{name}"), "enc", 5_000).unwrap();
             table.set_ready(seat, true);

@@ -1,0 +1,9 @@
+{
+  "name": "pokertui-relay",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test --no-warnings test/*.test.js",
+    "deploy": "wrangler deploy"
+  }
+}

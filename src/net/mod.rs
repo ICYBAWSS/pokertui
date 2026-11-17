@@ -4,15 +4,16 @@
 //! table snapshots. Clients verify every signature, apply only newer versions,
 //! and decrypt their own hole cards from a sealed per-player topic.
 
+pub mod cf;
 pub mod client;
 pub mod host;
 pub mod mqtt;
 pub mod protocol;
 pub mod roomcode;
 
-pub use client::{ClientConfig, run_client};
-pub use host::{HostConfig, run_host};
-pub use mqtt::{Link, Message};
+pub use client::{ClientConfig, run_client, run_client_on};
+pub use host::{HostConfig, run_host, run_host_on};
+pub use mqtt::{Link, MemoryBus, Message};
 pub use protocol::{Envelope, Payload, Topics};
 pub use roomcode::RoomId;
 
@@ -33,6 +34,10 @@ pub enum UiEvent {
     Info(String),
     Error(String),
     Closed(String),
+    /// This client took over as host after the old host vanished.
+    Promoted,
+    /// A finished hand that every human player has co-signed (for the leaderboard).
+    Bundle(crate::leaderboard::Bundle),
 }
 
 /// Commands flowing from the UI to the network side.
@@ -44,6 +49,10 @@ pub enum NetCommand {
     Ready(bool),
     Leave,
     Quit,
+    /// Host only: remove a seat, optionally banning its key.
+    Kick { seat: usize, ban: bool },
+    AddBot(crate::bot::Skill),
+    RemoveBot(usize),
 }
 
 pub fn sanitize_text(text: &str, max: usize) -> String {

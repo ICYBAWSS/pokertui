@@ -2,7 +2,7 @@
 
 I just thought this would be a cool and easy way for me and my friends to play poker.
 
-So I made this poker game that runs right in your terminal. One person hosts, everyone else joins using an 8-character room code. That's pretty much it.
+So I made this poker game that runs right in your terminal. One person hosts, everyone else joins using a 12-character room code. That's pretty much it.
 
 There's no setup, no websites, no server to manage u just open up your terminal and play.
 
@@ -135,3 +135,14 @@ alice (host)                                  bob (client)
 │ ratatui UI                    │      │ ratatui UI                    │
 │ game::Table                   │      │ client mirror                 │
 │ net::host                     │     
+
+## Extras
+
+- **Bots:** press `+` as host, or `poker host --bots easy,medium,hard`.
+- **Sit & Go tournaments:** pick it in the host menu. Blinds rise on a timer, last player wins.
+- **Kick / ban:** as host press `k` (remove) or `K` (ban), then the seat number.
+- **If the host drops,** the next player takes over and the table keeps going. If *you* drop, `poker rejoin` puts you back in your seat.
+- **Rankings:** the menu or `poker rankings` shows everyone you've played with.
+- **Fair shuffle:** every player adds randomness to each deal, and every finished hand is replayed and checked by every client.
+
+More in [docs/EXPERIMENTAL_FEATURES.md](docs/EXPERIMENTAL_FEATURES.md).

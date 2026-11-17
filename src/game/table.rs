@@ -5,6 +5,7 @@
 
 use super::cards::{Card, DECK_LEN, deck_bytes, full_deck, shuffle};
 use super::eval::{HandScore, eval_holdem};
+use crate::bot::Skill;
 use crate::crypto::{deck_commit, random_bytes};
 use anyhow::{Result, bail};
 use rand_chacha::ChaCha20Rng;
@@ -79,6 +80,64 @@ pub struct TableParams {
     pub big_blind: u64,
     pub buyin: u64,
     pub turn_ms: u64,
+    /// Sit-and-go settings; `None` is a normal cash table.
+    #[serde(default)]
+    pub tourney: Option<Tourney>,
+}
+
+/// Blind schedule for a single-table tournament.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tourney {
+    pub levels: Vec<(u64, u64)>,
+    pub level_secs: u64,
+}
+
+impl Tourney {
+    pub fn standard() -> Self {
+        Self {
+            levels: vec![
+                (25, 50), (50, 100), (75, 150), (100, 200), (150, 300),
+                (200, 400), (300, 600), (400, 800), (600, 1_200), (1_000, 2_000),
+            ],
+            level_secs: 300,
+        }
+    }
+
+    /// Blind level in force `elapsed_secs` after the first hand.
+    pub fn level_at(&self, elapsed_secs: u64) -> usize {
+        let lvl = (elapsed_secs / self.level_secs.max(1)) as usize;
+        lvl.min(self.levels.len().saturating_sub(1))
+    }
+}
+
+/// Points toward the rankings for a tournament finish (1-based place).
+pub fn tourney_points(place: usize) -> u32 {
+    match place {
+        1 => 10,
+        2 => 6,
+        3 => 4,
+        4 => 2,
+        5 => 1,
+        _ => 0,
+    }
+}
+
+/// Reveal of the joint shuffle seed, published with the hand result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SeedReveal {
+    /// `sha256(host_secret)`, published before the hand was dealt.
+    pub commit: String,
+    pub host: String,
+    pub contribs: Vec<(SeatId, String)>,
+}
+
+/// Tournament standing shown to everyone.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TourneyView {
+    pub level: usize,
+    pub next_level_at_ms: u64,
+    pub places: Vec<(SeatId, String, usize)>,
+    pub over: bool,
 }
 
 impl Default for TableParams {
@@ -89,6 +148,7 @@ impl Default for TableParams {
             big_blind: 50,
             buyin: 5_000,
             turn_ms: 60_000,
+            tourney: None,
         }
     }
 }
@@ -111,6 +171,8 @@ pub struct Seat {
     pub acted: bool,
     pub can_raise: bool,
     pub last_move: Option<String>,
+    pub bot: Option<Skill>,
+    pub place: Option<usize>,
 }
 
 impl Seat {
@@ -132,6 +194,8 @@ impl Seat {
             acted: false,
             can_raise: true,
             last_move: None,
+            bot: None,
+            place: None,
         }
     }
 
@@ -139,8 +203,10 @@ impl Seat {
         !self.folded && !self.hole.is_empty()
     }
 
+    /// Dealt in, not folded, not all-in, and has chips. Sitting-out seats hold
+    /// no cards, so they never get the action.
     pub fn can_act(&self) -> bool {
-        !self.folded && !self.all_in && self.stack > 0
+        !self.folded && !self.all_in && self.stack > 0 && !self.hole.is_empty()
     }
 }
 
@@ -158,6 +224,20 @@ pub struct SeatView {
     pub in_hand: bool,
     pub hole_count: usize,
     pub last_move: Option<String>,
+    #[serde(default)]
+    pub pubkey: String,
+    #[serde(default)]
+    pub enc_pub: String,
+    /// Stack at the start of the current/last hand.
+    #[serde(default)]
+    pub start_stack: u64,
+    #[serde(default)]
+    pub bot: bool,
+    #[serde(default)]
+    pub place: Option<usize>,
+    /// Hole cards shown face-up; only ever set in the delayed spectator feed.
+    #[serde(default)]
+    pub reveal: Vec<Card>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -185,6 +265,24 @@ pub struct TableView {
     pub last_result: Option<HandResult>,
     pub commit: Option<String>,
     pub message: String,
+    /// Bumped each time the host role moves to a new player.
+    #[serde(default)]
+    pub epoch: u32,
+    /// Host clock when this view was authored (heartbeat).
+    #[serde(default)]
+    pub host_ts_ms: u64,
+    /// Hash of the host's secret for the hand about to be dealt.
+    #[serde(default)]
+    pub seed_commit: Option<String>,
+    #[serde(default)]
+    pub params: TableParams,
+    #[serde(default)]
+    pub banned: Vec<String>,
+    #[serde(default)]
+    pub tourney: Option<TourneyView>,
+    /// True when spectators get a delayed, hole-card-revealing feed.
+    #[serde(default)]
+    pub spectate: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -196,6 +294,16 @@ pub struct HandResult {
     pub deck_nonce: String,
     pub deck: Vec<Card>,
     pub commit: String,
+    #[serde(default)]
+    pub seed: Option<SeedReveal>,
+    /// Every accepted move in order, so anyone can replay the hand.
+    #[serde(default)]
+    pub moves: Vec<(SeatId, Move)>,
+    #[serde(default)]
+    pub button: SeatId,
+    /// (seat, stack before the deal, stack after payout) for every seat dealt in.
+    #[serde(default)]
+    pub stacks: Vec<(SeatId, u64, u64)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -241,6 +349,8 @@ pub struct HandRecord {
     pub players: Vec<RecordPlayer>,
     pub actions: Vec<String>,
     pub result: HandResult,
+    #[serde(default)]
+    pub button: SeatId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -249,6 +359,15 @@ pub struct RecordPlayer {
     pub name: String,
     pub starting_stack: u64,
     pub hole: Vec<Card>,
+    #[serde(default)]
+    pub ending_stack: u64,
+    /// Whether this seat was dealt in (sitting-out seats are listed but not dealt).
+    #[serde(default = "yes")]
+    pub dealt: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 pub struct Table {
@@ -272,6 +391,8 @@ pub struct Table {
     pub actions: Vec<String>,
     start_stacks: Vec<u64>,
     started_at_ms: u64,
+    seed_reveal: Option<SeedReveal>,
+    moves: Vec<(SeatId, Move)>,
     /// Cursor into `deck`; `deck` always holds the full committed 52 cards so the
     /// reveal can be verified against the commitment.
     draw_idx: usize,
@@ -304,6 +425,8 @@ impl Table {
             actions: Vec::new(),
             start_stacks: vec![0; n],
             started_at_ms: 0,
+            seed_reveal: None,
+            moves: Vec::new(),
             draw_idx: 0,
         }
     }
@@ -360,6 +483,9 @@ impl Table {
         }
         if self.phase == Phase::Betting {
             bail!("a hand is in progress");
+        }
+        if self.params.tourney.is_some() && self.hand_no > 0 {
+            bail!("the tournament has started");
         }
         let seat = self
             .seats
@@ -429,6 +555,25 @@ impl Table {
 
     /// Deterministic variant for tests and reproducible replays.
     pub fn start_hand_seeded(&mut self, now_ms: u64, seed: [u8; 32]) -> Result<()> {
+        let mut deck = full_deck();
+        shuffle(&mut deck, &mut ChaCha20Rng::from_seed(seed));
+        self.start_hand_inner(now_ms, deck, random_bytes::<16>()?, None)
+    }
+
+    /// Records how the deck seed was derived so the result can prove it.
+    pub fn set_seed_reveal(&mut self, reveal: Option<SeedReveal>) {
+        self.seed_reveal = reveal;
+    }
+
+    /// Starts a hand from an already-shuffled deck. `button` pins the dealer
+    /// seat (used by replay); `None` advances it normally.
+    pub fn start_hand_inner(
+        &mut self,
+        now_ms: u64,
+        deck: Vec<Card>,
+        nonce: [u8; 16],
+        button: Option<SeatId>,
+    ) -> Result<()> {
         if self.phase == Phase::Betting {
             bail!("hand already in progress");
         }
@@ -439,7 +584,9 @@ impl Table {
 
         // Move the button to the next eligible seat, or to the first eligible seat
         // when the previous button seat is empty.
-        self.button = if self.seats[self.button].is_some() && eligible.contains(&self.button) {
+        self.button = if let Some(b) = button {
+            b
+        } else if self.seats[self.button].is_some() && eligible.contains(&self.button) {
             self.next_eligible_after(self.button).unwrap_or(self.button)
         } else {
             *eligible.first().unwrap()
@@ -453,6 +600,7 @@ impl Table {
         self.last_result = None;
         self.started_at_ms = now_ms;
         self.commit = None;
+        self.moves.clear();
 
         self.start_stacks = self
             .seats
@@ -469,12 +617,8 @@ impl Table {
             s.acted = false;
             s.can_raise = true;
             s.last_move = None;
-            s.timeout_streak = 0;
         }
 
-        let mut deck = full_deck();
-        shuffle(&mut deck, &mut ChaCha20Rng::from_seed(seed));
-        let nonce = random_bytes::<16>()?;
         self.commit = Some(deck_commit(&nonce, &deck_bytes(&deck)));
         self.nonce = nonce;
         self.deck = deck;
@@ -652,6 +796,15 @@ impl Table {
     }
 
     pub fn apply(&mut self, seat: SeatId, mv: Move, now_ms: u64) -> Result<Applied> {
+        // Recorded before applying: the result built when a hand ends must
+        // already contain its final move.
+        self.moves.push((seat, mv.clone()));
+        self.apply_inner(seat, mv, now_ms).inspect_err(|_| {
+            self.moves.pop();
+        })
+    }
+
+    fn apply_inner(&mut self, seat: SeatId, mv: Move, now_ms: u64) -> Result<Applied> {
         if self.phase != Phase::Betting {
             bail!("no hand in progress");
         }
@@ -689,7 +842,7 @@ impl Table {
             }
             Move::Call => {
                 if legal.to_call == 0 {
-                    return self.apply(seat, Move::Check, now_ms);
+                    return self.apply_inner(seat, Move::Check, now_ms);
                 }
                 let pay = legal.to_call.min(self.stack_of(seat));
                 if let Some(Some(s)) = self.seats.get_mut(seat) {
@@ -890,6 +1043,10 @@ impl Table {
             deck_nonce: crate::crypto::b64(&self.nonce),
             deck: self.deck.clone(),
             commit,
+            seed: self.seed_reveal.take(),
+            moves: self.moves.clone(),
+            button: self.button,
+            stacks: self.dealt_stacks(),
         };
         for (_, s) in self.players_mut() {
             s.bet = 0;
@@ -900,6 +1057,7 @@ impl Table {
         self.actor = None;
         self.deadline_ms = 0;
         self.note(format!("{name} wins {amount} uncontested"));
+        self.assign_places();
         self.bump();
     }
 
@@ -1020,6 +1178,10 @@ impl Table {
             deck_nonce: crate::crypto::b64(&self.nonce),
             deck: self.deck.clone(),
             commit,
+            seed: self.seed_reveal.take(),
+            moves: self.moves.clone(),
+            button: self.button,
+            stacks: self.dealt_stacks(),
         };
 
         for (_, s) in self.players_mut() {
@@ -1043,7 +1205,15 @@ impl Table {
             .collect::<Vec<_>>()
             .join(" · ");
         self.note(format!("showdown: {summary}"));
+        self.assign_places();
         self.bump();
+    }
+
+    fn dealt_stacks(&self) -> Vec<(SeatId, u64, u64)> {
+        self.players()
+            .filter(|(_, s)| !s.hole.is_empty())
+            .map(|(i, s)| (i, self.start_stacks.get(i).copied().unwrap_or(0), s.stack))
+            .collect()
     }
 
     fn seat_distance_from_button(&self, seat: SeatId) -> usize {
@@ -1090,6 +1260,12 @@ impl Table {
                         in_hand: s.in_hand(),
                         hole_count: s.hole.len(),
                         last_move: s.last_move.clone(),
+                        pubkey: s.pubkey.clone(),
+                        enc_pub: s.enc_pub.clone(),
+                        start_stack: self.start_stacks.get(i).copied().unwrap_or(0),
+                        bot: s.bot.is_some(),
+                        place: s.place,
+                        reveal: Vec::new(),
                     },
                     None => SeatView {
                         seat: i,
@@ -1104,12 +1280,25 @@ impl Table {
                         in_hand: false,
                         hole_count: 0,
                         last_move: None,
+                        pubkey: String::new(),
+                        enc_pub: String::new(),
+                        start_stack: 0,
+                        bot: false,
+                        place: None,
+                        reveal: Vec::new(),
                     },
                 })
                 .collect(),
             last_result: self.last_result.clone(),
             commit: self.commit.map(|c| crate::crypto::b64(&c)),
             message: self.message.clone(),
+            epoch: 0,
+            host_ts_ms: 0,
+            seed_commit: None,
+            params: self.params.clone(),
+            banned: Vec::new(),
+            tourney: None,
+            spectate: false,
         }
     }
 
@@ -1127,16 +1316,202 @@ impl Table {
                     name: s.name.clone(),
                     starting_stack: self.start_stacks.get(i).copied().unwrap_or(0),
                     hole: s.hole.clone(),
+                    ending_stack: s.stack,
+                    dealt: !s.hole.is_empty(),
                 })
                 .collect(),
             actions: self.actions.clone(),
             result,
+            button: self.button,
+        })
+    }
+
+    /// Rebuilds a table from the last view after the host vanished. The hand in
+    /// progress is cancelled: everyone gets their pre-hand stack back.
+    pub fn from_view(view: &TableView) -> Table {
+        let mut t = Table::new(view.params.clone());
+        t.button = view.button;
+        t.hand_no = view.hand_no;
+        t.version = view.version + 1;
+        for sv in &view.seats {
+            if sv.name.is_empty() || sv.bot {
+                continue;
+            }
+            let stack = if view.phase == Phase::Betting { sv.start_stack } else { sv.stack };
+            let mut s = Seat::new(sv.name.clone(), sv.pubkey.clone(), sv.enc_pub.clone(), stack);
+            s.connected = sv.connected;
+            s.ready = sv.ready;
+            s.sitting_out = sv.sitting_out;
+            s.place = sv.place;
+            if let Some(slot) = t.seats.get_mut(sv.seat) {
+                *slot = Some(s);
+            }
+        }
+        t
+    }
+
+    pub fn set_blinds(&mut self, small: u64, big: u64) {
+        self.params.small_blind = small;
+        self.params.big_blind = big;
+        self.bump();
+    }
+
+    pub fn join_bot(&mut self, name: &str, skill: Skill) -> Result<SeatId> {
+        if self.phase == Phase::Betting {
+            bail!("a hand is in progress");
+        }
+        let seat = self
+            .seats
+            .iter()
+            .position(|s| s.is_none())
+            .ok_or_else(|| anyhow::anyhow!("table is full"))?;
+        let mut s = Seat::new(name.to_string(), format!("bot:{seat}"), String::new(), self.params.buyin);
+        s.bot = Some(skill);
+        self.seats[seat] = Some(s);
+        self.bump();
+        Ok(seat)
+    }
+
+    /// Tournament finishing places: busted seats rank below everyone left, and
+    /// among seats busting together the smaller starting stack finishes lower.
+    fn assign_places(&mut self) {
+        if self.params.tourney.is_none() {
+            return;
+        }
+        let alive = self.players().filter(|(_, s)| s.stack > 0).count();
+        let mut busted: Vec<(SeatId, u64)> = self
+            .players()
+            .filter(|(i, s)| s.stack == 0 && s.place.is_none() && self.start_stacks[*i] > 0)
+            .map(|(i, _)| (i, self.start_stacks[i]))
+            .collect();
+        busted.sort_by_key(|(_, start)| *start);
+        let mut place = alive + busted.len();
+        for (seat, _) in busted {
+            if let Some(Some(s)) = self.seats.get_mut(seat) {
+                s.place = Some(place);
+            }
+            place -= 1;
+        }
+        if alive == 1 {
+            for (_, s) in self.players_mut() {
+                if s.stack > 0 {
+                    s.place = Some(1);
+                }
+            }
+        }
+    }
+
+    /// The tournament standing shown to every player.
+    pub fn tourney_view(&self, level: usize, next_level_at_ms: u64) -> Option<TourneyView> {
+        self.params.tourney.as_ref()?;
+        let mut places: Vec<(SeatId, String, usize)> = self
+            .players()
+            .filter_map(|(i, s)| s.place.map(|p| (i, s.name.clone(), p)))
+            .collect();
+        places.sort_by_key(|(_, _, p)| *p);
+        Some(TourneyView {
+            level,
+            next_level_at_ms,
+            over: self.phase != Phase::Betting
+                && self.hand_no > 0
+                && self.players().filter(|(_, s)| s.stack > 0).count() <= 1,
+            places,
         })
     }
 
     pub fn started_at_ms(&self) -> u64 {
         self.started_at_ms
     }
+}
+
+/// Rebuild a hand record from the last view, for live verification by clients.
+pub fn record_from_view(view: &TableView) -> Option<HandRecord> {
+    let result = view.last_result.clone()?;
+    let players = result
+        .stacks
+        .iter()
+        .map(|(seat, start, end)| RecordPlayer {
+            seat: *seat,
+            name: view.seats.get(*seat).map(|s| s.name.clone()).unwrap_or_default(),
+            starting_stack: *start,
+            hole: Vec::new(),
+            ending_stack: *end,
+            dealt: true,
+        })
+        .collect();
+    Some(HandRecord {
+        room: view.room.clone(),
+        hand_no: result.hand_no,
+        board: result.board.clone(),
+        stakes: (view.small_blind, view.big_blind),
+        players,
+        actions: Vec::new(),
+        button: result.button,
+        result,
+    })
+}
+
+/// Re-run the recorded moves on the committed deck and check the chip counts.
+/// A host that misreports a pot or an action fails here.
+pub fn replay_record(record: &HandRecord) -> Result<()> {
+    use crate::crypto::b64_decode;
+    let max = record.players.iter().map(|p| p.seat).max().unwrap_or(1) + 1;
+    let mut t = Table::new(TableParams {
+        max_seats: max.max(2),
+        small_blind: record.stakes.0,
+        big_blind: record.stakes.1,
+        buyin: 0,
+        turn_ms: 0,
+        tourney: None,
+    });
+    for p in record.players.iter().filter(|p| p.dealt && p.starting_stack > 0) {
+        t.seats[p.seat] = Some(Seat::new(p.name.clone(), String::new(), String::new(), p.starting_stack));
+    }
+    let nonce: [u8; 16] = b64_decode(&record.result.deck_nonce)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("nonce must be 16 bytes"))?;
+    t.start_hand_inner(0, record.result.deck.clone(), nonce, Some(record.result.button))?;
+    for (seat, mv) in &record.result.moves {
+        t.apply(*seat, mv.clone(), 0)
+            .map_err(|e| anyhow::anyhow!("recorded move by seat {seat} is illegal: {e}"))?;
+    }
+    if t.phase != Phase::HandOver {
+        bail!("replayed hand did not finish");
+    }
+    for p in record.players.iter().filter(|p| p.dealt) {
+        let got = t.seats.get(p.seat).and_then(|s| s.as_ref()).map(|s| s.stack).unwrap_or(0);
+        if got != p.ending_stack {
+            bail!("seat {} ends with {} but the host reported {}", p.seat, got, p.ending_stack);
+        }
+    }
+    Ok(())
+}
+
+/// Check the joint shuffle: the host's secret matches its earlier commitment,
+/// and mixing it with every contribution reproduces the committed deck.
+pub fn verify_seed(deck: &[Card], reveal: &SeedReveal) -> Result<()> {
+    use crate::crypto::{b64, b64_decode, mix_seed, seed_commit};
+    let host: [u8; 32] = b64_decode(&reveal.host)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("host seed must be 32 bytes"))?;
+    if b64(&seed_commit(&host)) != reveal.commit {
+        bail!("host seed does not match its commitment");
+    }
+    let mut contribs = Vec::new();
+    for (seat, r) in &reveal.contribs {
+        let r: [u8; 32] = b64_decode(r)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("contribution must be 32 bytes"))?;
+        contribs.push((*seat, r));
+    }
+    contribs.sort_by_key(|(seat, _)| *seat);
+    let seed = mix_seed(&host, &contribs);
+    let mut expect = full_deck();
+    shuffle(&mut expect, &mut ChaCha20Rng::from_seed(seed));
+    if expect != deck {
+        bail!("deck is not the shuffle of the revealed seed");
+    }
+    Ok(())
 }
 
 /// Verify a recorded hand's deck commitment.
@@ -1171,6 +1546,12 @@ pub fn verify_record(record: &HandRecord) -> Result<()> {
             bail!("card {card} shown on the table is not in the committed deck");
         }
     }
+    if let Some(seed) = &record.result.seed {
+        verify_seed(deck, seed)?;
+    }
+    if !record.result.moves.is_empty() {
+        replay_record(record)?;
+    }
     Ok(())
 }
 
@@ -1185,6 +1566,7 @@ mod tests {
             big_blind: 10,
             buyin: stack,
             turn_ms: 60_000,
+            tourney: None,
         });
         for i in 0..seats {
             t.join(&format!("p{i}"), &format!("key{i}"), &format!("enc{i}"), stack)
@@ -1354,6 +1736,7 @@ mod tests {
                 big_blind: 10,
                 buyin,
                 turn_ms: 60_000,
+                tourney: None,
             });
             for i in 0..seats {
                 t.join(&format!("p{i}"), &format!("key{i}"), &format!("enc{i}"), buyin)
@@ -1461,5 +1844,137 @@ mod tests {
         let mut tampered = record.clone();
         tampered.result.commit = "AAAA".into();
         assert!(verify_record(&tampered).is_err());
+    }
+
+    fn play_out(t: &mut Table) {
+        while t.phase == Phase::Betting {
+            let a = actor(t);
+            let legal = t.legal(a).unwrap();
+            t.apply(a, if legal.to_call > 0 { Move::Call } else { Move::Check }, 0).unwrap();
+        }
+    }
+
+    /// A host that misreports a stack, drops a move or invents one is caught by replay.
+    #[test]
+    fn replay_catches_a_lying_host() {
+        let mut t = rig(3, 1_000);
+        play_out(&mut t);
+        let record = t.hand_record("room").unwrap();
+        replay_record(&record).unwrap();
+        verify_record(&record).unwrap();
+
+        let mut bad = record.clone();
+        bad.players[0].ending_stack += 10;
+        assert!(replay_record(&bad).is_err(), "inflated stack");
+
+        let mut bad = record.clone();
+        bad.result.moves.pop();
+        assert!(replay_record(&bad).is_err(), "missing move");
+
+        let mut bad = record.clone();
+        bad.result.moves.insert(0, (2, Move::AllIn));
+        assert!(replay_record(&bad).is_err(), "move out of turn");
+    }
+
+    /// The same checks work from a client's view of the finished hand.
+    #[test]
+    fn clients_can_audit_a_hand_from_the_view_alone() {
+        let mut t = rig(3, 1_000);
+        play_out(&mut t);
+        let mut view = t.view("room");
+        let record = record_from_view(&view).unwrap();
+        verify_record(&record).unwrap();
+        // Host shaves a winner's pot: the stacks no longer replay.
+        let result = view.last_result.as_mut().unwrap();
+        let (_, _, end) = result.stacks.iter_mut().max_by_key(|(_, _, e)| *e).unwrap();
+        *end -= 25;
+        assert!(verify_record(&record_from_view(&view).unwrap()).is_err());
+    }
+
+    /// The host cannot grind a favourable deck: the deck must be exactly the
+    /// shuffle of host secret + player contributions it committed to.
+    #[test]
+    fn joint_seed_blocks_a_stacked_deck() {
+        use crate::crypto::{b64, mix_seed, seed_commit};
+        let secret = [1u8; 32];
+        let (r1, r2) = ([2u8; 32], [3u8; 32]);
+        let seed = mix_seed(&secret, &[(1, r1), (2, r2)]);
+        let reveal = SeedReveal {
+            commit: b64(&seed_commit(&secret)),
+            host: b64(&secret),
+            contribs: vec![(1, b64(&r1)), (2, b64(&r2))],
+        };
+        let mut deck = full_deck();
+        shuffle(&mut deck, &mut ChaCha20Rng::from_seed(seed));
+        verify_seed(&deck, &reveal).unwrap();
+
+        let mut stacked = full_deck();
+        shuffle(&mut stacked, &mut ChaCha20Rng::from_seed([9; 32]));
+        assert!(verify_seed(&stacked, &reveal).is_err(), "deck from another seed");
+
+        let mut bad = reveal.clone();
+        bad.contribs[0].1 = b64(&[7u8; 32]);
+        assert!(verify_seed(&deck, &bad).is_err(), "swapped contribution");
+
+        let mut bad = reveal.clone();
+        bad.contribs.pop();
+        assert!(verify_seed(&deck, &bad).is_err(), "dropped a player's input");
+
+        let mut bad = reveal.clone();
+        bad.commit = b64(&[0u8; 32]);
+        assert!(verify_seed(&deck, &bad).is_err(), "commitment does not match secret");
+    }
+
+    #[test]
+    fn tournament_places_and_blind_levels() {
+        let tourney = Tourney { levels: vec![(10, 20), (20, 40), (40, 80)], level_secs: 60 };
+        assert_eq!(tourney.level_at(0), 0);
+        assert_eq!(tourney.level_at(59), 0);
+        assert_eq!(tourney.level_at(61), 1);
+        assert_eq!(tourney.level_at(10_000), 2, "stays on the last level");
+
+        let mut t = Table::new(TableParams {
+            max_seats: 3,
+            small_blind: 10,
+            big_blind: 20,
+            buyin: 100,
+            turn_ms: 0,
+            tourney: Some(tourney),
+        });
+        for i in 0..3 {
+            t.join(&format!("p{i}"), &format!("k{i}"), "e", 100).unwrap();
+        }
+        for hand in 0..200 {
+            if t.start_hand(hand).is_err() {
+                break;
+            }
+            while t.phase == Phase::Betting {
+                let a = actor(&t);
+                t.apply(a, Move::AllIn, 0).unwrap();
+            }
+        }
+        let mut places: Vec<usize> = t.players().filter_map(|(_, s)| s.place).collect();
+        places.sort();
+        assert_eq!(places, vec![1, 2, 3]);
+        assert!(t.join("late", "k9", "e", 100).is_err(), "no joining a running tournament");
+        assert!(t.tourney_view(0, 0).unwrap().over);
+    }
+
+    #[test]
+    fn sat_out_players_are_never_dealt_or_asked_to_act() {
+        let mut t = rig(3, 1_000);
+        play_out(&mut t);
+        t.seats[0].as_mut().unwrap().sitting_out = true;
+        t.start_hand(1).unwrap();
+        assert!(t.seats[0].as_ref().unwrap().hole.is_empty());
+        for _ in 0..30 {
+            if t.phase != Phase::Betting {
+                break;
+            }
+            let a = actor(&t);
+            assert_ne!(a, 0, "sitting-out seat got the action");
+            let legal = t.legal(a).unwrap();
+            t.apply(a, if legal.to_call > 0 { Move::Call } else { Move::Check }, 0).unwrap();
+        }
     }
 }

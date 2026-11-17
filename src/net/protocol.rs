@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -73,6 +73,26 @@ pub enum Payload {
         cards_hand: u32,
     },
     Leave {},
+    /// A player's randomness for the next shuffle.
+    Entropy {
+        hand: u32,
+        r: String,
+    },
+    /// The host removed (and maybe banned) a player.
+    Kicked {
+        to: String,
+        reason: String,
+        ban: bool,
+    },
+    /// A player's signature over the result of the hand that just finished.
+    ResultAck {
+        hand_hash: String,
+        sig: String,
+    },
+    /// One frame of the delayed spectator feed (hole cards revealed).
+    Delayed {
+        view: TableView,
+    },
     Sealed {
         sealed: Sealed,
     },
@@ -103,7 +123,7 @@ fn signing_bytes(
     // JSON of a derived struct with fixed field order is stable across versions
     // of this crate, which is all that matters: both ends run the same code.
     let body = serde_json::to_string(payload)?;
-    Ok(format!("pokertui-v1|{room}|{from}|{seq}|{ts_ms}|{body}").into_bytes())
+    Ok(format!("pokertui-v2|{room}|{from}|{seq}|{ts_ms}|{body}").into_bytes())
 }
 
 impl Envelope {
@@ -142,21 +162,32 @@ impl Envelope {
     }
 }
 
-/// MQTT topics for one room.
+/// MQTT topics for one room, plus the key every packet in it is encrypted with.
 #[derive(Clone, Debug)]
 pub struct Topics {
     pub room: String,
+    key: [u8; 32],
 }
 
 impl Topics {
-    pub fn new(id: &[u8; 5]) -> Self {
+    pub fn new(id: &crate::net::roomcode::RoomId) -> Self {
         Self {
-            room: crate::net::roomcode::hex(id),
+            room: crate::net::roomcode::topic_id(id),
+            key: crate::net::roomcode::room_key(id),
         }
     }
 
+    /// Encrypt an outgoing packet so the broker and topic-listers see noise.
+    pub fn wrap(&self, packet: &[u8]) -> Result<Vec<u8>> {
+        crate::crypto::box_up(&self.key, packet)
+    }
+
+    pub fn unwrap(&self, data: &[u8]) -> Result<Vec<u8>> {
+        crate::crypto::box_open(&self.key, data)
+    }
+
     pub fn base(&self) -> String {
-        format!("pokertui/v1/{}", self.room)
+        format!("pokertui/v2/{}", self.room)
     }
 
     pub fn events(&self) -> String {
@@ -170,6 +201,11 @@ impl Topics {
 
     /// Per-player sealed payloads. Anyone may subscribe; only the holder of the
     /// matching X25519 key can decrypt.
+    /// Delayed spectator frames, published only after a hand has finished.
+    pub fn spectate(&self) -> String {
+        format!("{}/spectate", self.base())
+    }
+
     pub fn secrets(&self, pubkey: &str) -> String {
         format!("{}/secrets/{}", self.base(), pubkey)
     }
@@ -220,6 +256,7 @@ mod tests {
             big_blind: 50,
             buyin: 2_000,
             turn_ms: 20_000,
+            tourney: None,
         });
         for name in ["host", "alice", "bob"] {
             let seat = table.join(name, &format!("pk-{name}"), "enc", 2_000).unwrap();
@@ -249,12 +286,13 @@ mod tests {
 
     #[test]
     fn topics_are_room_scoped() {
-        let t = Topics::new(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
-        assert_eq!(t.events(), "pokertui/v1/aabbccddee/events");
-        assert_eq!(t.snapshot(), "pokertui/v1/aabbccddee/snapshot");
-        assert_eq!(
-            t.secrets("abc"),
-            "pokertui/v1/aabbccddee/secrets/abc"
-        );
+        let t = Topics::new(&[0, 0, 0, 0, 0, 0, 0, 1]);
+        assert!(t.events().starts_with("pokertui/v2/"));
+        assert!(t.events().ends_with("/events"));
+        assert!(t.snapshot().ends_with("/snapshot"));
+        assert!(t.secrets("abc").ends_with("/secrets/abc"));
+        let packet = t.wrap(b"x").unwrap();
+        assert_eq!(t.unwrap(&packet).unwrap(), b"x");
+        assert!(Topics::new(&[0, 0, 0, 0, 0, 0, 0, 2]).unwrap(&packet).is_err());
     }
 }
