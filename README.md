@@ -8,7 +8,7 @@ There's no setup, no websites, no server to manage u just open up your terminal 
 
 ## Getting started
 
-**macOS / Linux / Raspberry Pi (64-bit)**
+**macOS / Linux
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.sh | sh
