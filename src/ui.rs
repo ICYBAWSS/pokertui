@@ -935,6 +935,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         row("Enter", "deal (host)"),
         row("+", "add a bot (host)"),
         row("k  K", "kick / ban (host)"),
+        row("y  n", "accept / decline joiner"),
         row("i", "sit back in"),
         row("t  /", "chat"),
         row("Esc  q", "leave"),

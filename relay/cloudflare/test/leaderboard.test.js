@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { subtle } from "node:crypto";
-import { handleFrame, handHash, MIN_HANDS } from "../src/leaderboard.js";
+import { handleFrame, handHash, applyBundle, MIN_HANDS, MIN_DISTINCT, PAIR_CAP } from "../src/leaderboard.js";
 import { b64uEncode } from "../src/crypto.js";
 import { newDb, fixture } from "./helpers.js";
 
@@ -105,4 +105,38 @@ test("handHash is order-independent and sensitive to every field", async () => {
   assert.equal(await handHash({ ...base, players: [...p].reverse() }), h);
   assert.notEqual(await handHash({ ...base, hand_no: 2 }), h);
   assert.notEqual(await handHash({ ...base, players: [{ pubkey: "b", delta: -6 }, p[1]] }), h);
+});
+
+// Direct hand application (signatures are checked elsewhere), to test the rating rules.
+let n = 0;
+const hand = (winner, loser, chips = 1000) => ({
+  hand_hash: `h${n++}`, room: "r", hand_no: n, commit: "c", ts_ms: NOW, bb: 50,
+  players: [{ pubkey: winner, delta: chips }, { pubkey: loser, delta: -chips }], sigs: {},
+});
+const rating = (db, pk) => db.raw.prepare("SELECT rating FROM players WHERE pubkey = ?").get(pk)?.rating ?? 1000;
+
+test("playing yourself from a fresh account earns nothing", async () => {
+  const db = newDb();
+  for (let i = 0; i < 200; i++) await applyBundle(db, hand("main", "alt"), NOW);
+  assert.equal(rating(db, "main"), 1000, "no rating from an account with no other opponents");
+  assert.ok(rating(db, "alt") < 1000, "the alt still loses rating");
+});
+
+test("an established opponent pays out, but only up to the per-opponent cap", async () => {
+  const db = newDb();
+  for (let i = 0; i < MIN_DISTINCT; i++) await applyBundle(db, hand(`friend${i}`, "vet"), NOW); // vet meets 5 others
+  await applyBundle(db, hand("main", "vet"), NOW);
+  const first = rating(db, "main") - 1000;
+  assert.ok(first > 0, "a real opponent counts");
+  for (let i = 0; i < 300; i++) await applyBundle(db, hand("main", "vet"), NOW);
+  assert.ok(rating(db, "main") - 1000 <= PAIR_CAP + 1e-9, `farming one opponent is capped at ${PAIR_CAP}`);
+});
+
+test("a ring of fresh accounts cannot bootstrap itself past the caps", async () => {
+  const db = newDb();
+  const ring = ["a", "b", "c", "d", "e", "f"];
+  for (let round = 0; round < 40; round++) {
+    for (const x of ring) for (const y of ring) if (x !== y) await applyBundle(db, hand(x, y, 500), NOW);
+  }
+  for (const x of ring) assert.ok(rating(db, x) - 1000 <= PAIR_CAP * (ring.length - 1) + 1e-9);
 });

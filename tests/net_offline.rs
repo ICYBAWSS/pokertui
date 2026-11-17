@@ -322,3 +322,32 @@ async fn bot_games_produce_no_leaderboard_bundles() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(host.state().bundles.is_empty());
 }
+
+/// With approval on, strangers wait until the host says yes; the host can decline;
+/// and a returning player is not asked again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_approval_gates_new_players_only() {
+    let r = room(MemoryBus::new(), 4, 2_000);
+    let host = spawn_host(&r, "host", |c| c.approve_joins = true);
+    let alice = spawn_client(&r, "alice", None, |_| {});
+    wait_for(5.0, "alice is waiting", || host.state().waiting == vec!["alice".to_string()]).await;
+    assert_eq!(seated(&host), 1, "not seated yet");
+    assert!(alice.state().seat.is_none());
+
+    host.send(NetCommand::Approve(true));
+    wait_for(5.0, "alice seated", || alice.state().seat.is_some() && seated(&host) == 2).await;
+
+    let bob = spawn_client(&r, "bob", None, |_| {});
+    wait_for(5.0, "bob is waiting", || host.state().waiting == vec!["bob".to_string()]).await;
+    host.send(NetCommand::Approve(false));
+    wait_for(5.0, "bob turned away", || bob.state().closed.is_some()).await;
+    assert!(bob.state().closed.clone().unwrap().contains("declined"));
+    assert_eq!(seated(&host), 2);
+
+    // Alice crashes and comes back: straight in, no second approval.
+    alice.send(NetCommand::Quit);
+    wait_for(2.0, "alice gone", || alice.state().closed.is_some()).await;
+    let alice2 = spawn_client(&r, "alice", Some(alice.id.clone()), |_| {});
+    wait_for(5.0, "alice back without approval", || alice2.state().seat.is_some()).await;
+    assert!(host.state().waiting.is_empty());
+}

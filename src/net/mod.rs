@@ -38,6 +38,8 @@ pub enum UiEvent {
     Promoted,
     /// A finished hand that every human player has co-signed (for the leaderboard).
     Bundle(crate::leaderboard::Bundle),
+    /// Players waiting for the host to let them in (names, oldest first).
+    Waiting(Vec<String>),
 }
 
 /// Commands flowing from the UI to the network side.
@@ -53,6 +55,8 @@ pub enum NetCommand {
     Kick { seat: usize, ban: bool },
     AddBot(crate::bot::Skill),
     RemoveBot(usize),
+    /// Host only: accept or decline the oldest player waiting to join.
+    Approve(bool),
 }
 
 pub fn sanitize_text(text: &str, max: usize) -> String {

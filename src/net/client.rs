@@ -73,6 +73,8 @@ struct Client {
     asked_commit: Option<String>,
     acks: AckBook,
     pending_ack: Option<Payload>,
+    /// When the host first said it is deciding on our join request.
+    pending_since: Option<Instant>,
 }
 
 pub async fn run_client(
@@ -131,9 +133,11 @@ pub async fn run_client_on(
                 if let Some(view) = client.tick(&mut link).await {
                     return promote(link, client, view, tx, rx).await;
                 }
+                // A host that is deciding gets two minutes; a silent room gets 25 s.
+                let patience = if client.pending_since.is_some() { 120 } else { 25 };
                 if !client.joined
                     && !client.cfg.spectate
-                    && started.elapsed() > Duration::from_secs(25)
+                    && started.elapsed() > Duration::from_secs(patience)
                 {
                     let _ = tx.send(UiEvent::Closed(
                         "no host answered on that room code".into(),
@@ -206,6 +210,7 @@ impl Client {
             asked_commit: None,
             acks: AckBook::new(identity),
             pending_ack: None,
+            pending_since: None,
         }
     }
 
@@ -379,6 +384,12 @@ impl Client {
                 self.joined = true;
                 let _ = self.tx.send(UiEvent::Joined { seat });
                 self.apply_view(view);
+            }
+            Payload::JoinPending { to } => {
+                if to == self.me() && self.pending_since.is_none() {
+                    self.pending_since = Some(Instant::now());
+                    let _ = self.tx.send(UiEvent::Info("waiting for the host to let you in…".into()));
+                }
             }
             Payload::JoinReject { to, reason } => {
                 if to == self.me() {
@@ -590,7 +601,7 @@ impl Client {
                     .tx
                     .send(UiEvent::Info("only the host can deal".into()));
             }
-            NetCommand::Kick { .. } | NetCommand::AddBot(_) | NetCommand::RemoveBot(_) => {
+            NetCommand::Kick { .. } | NetCommand::AddBot(_) | NetCommand::RemoveBot(_) | NetCommand::Approve(_) => {
                 let _ = self
                     .tx
                     .send(UiEvent::Info("only the host can do that".into()));

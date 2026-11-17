@@ -140,6 +140,7 @@ alice (host)                                  bob (client)
 
 - **Bots:** press `+` as host, or `poker host --bots easy,medium,hard`.
 - **Sit & Go tournaments:** pick it in the host menu. Blinds rise on a timer, last player wins.
+- **Approve joiners:** `poker host --approve` makes new players wait until you press `y` (accept) or `n` (decline). Players returning to their own seat skip it.
 - **Kick / ban:** as host press `k` (remove) or `K` (ban), then the seat number.
 - **If the host drops,** the next player takes over and the table keeps going. If *you* drop, `poker rejoin` puts you back in your seat.
 - **Rankings:** the menu or `poker rankings` shows everyone you've played with.

@@ -31,7 +31,7 @@
 >
 > **Known limits** (none of these are new, but the review turned them up):
 > - The host still sees every card in a normal game; only mental poker (not wired in) fixes that.
-> - Players who collude, or one person running two windows, cannot be detected in software. The global leaderboard is exposed to this: co-signing proves the players agreed, not that they were independent.
+> - Players who collude, or one person running two windows, cannot be detected in software. The global leaderboard limits the damage instead: a win only earns rating from an opponent who has already played at least 5 other people, and any one opponent can pay out at most 25 rating points in total. Playing yourself from fresh accounts earns nothing; a ring of six accounts is capped at about 125 points each.
 > - A seated player can still pretend to be the host to *new joiners* after a migration.
 > - Join requests are not rate-limited, but they need the room code.
 

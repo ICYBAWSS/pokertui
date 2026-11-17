@@ -106,6 +106,8 @@ pub struct App {
     pub bell: bool,
     /// Host kick/ban picker: `Some(ban)` while waiting for a seat number.
     pub kick_mode: Option<bool>,
+    /// Players waiting for you (the host) to let them in.
+    pub waiting: Vec<String>,
     bot_next: crate::bot::Skill,
     /// Local rankings, updated after every hand (None disables recording).
     pub stats: Option<crate::rank::Rankings>,
@@ -152,6 +154,7 @@ impl App {
             anim: Anim::default(),
             bell: false,
             kick_mode: None,
+            waiting: Vec::new(),
             bot_next: crate::bot::Skill::Easy,
             stats: None,
             stats_seen: None,
@@ -200,6 +203,13 @@ impl App {
             }
             UiEvent::Info(text) => self.push_log(LogKind::Info, text),
             UiEvent::Promoted => self.mode = Mode::Host,
+            UiEvent::Waiting(names) => {
+                if let Some(first) = names.iter().find(|n| !self.waiting.contains(n)) {
+                    self.set_notice(format!("{first} wants to join: y accept · n decline"));
+                    self.bell = true;
+                }
+                self.waiting = names;
+            }
             UiEvent::Bundle(bundle) => {
                 if let Some((dir, key)) = &self.outbox {
                     let now = now_ms();
@@ -565,6 +575,9 @@ impl App {
             return true;
         }
         match key.code {
+            KeyCode::Char(c @ ('y' | 'n')) if self.mode == Mode::Host && !self.waiting.is_empty() => {
+                let _ = self.net.send(NetCommand::Approve(c == 'y'));
+            }
             KeyCode::Char('+') if self.mode == Mode::Host => {
                 let skill = self.bot_next;
                 self.bot_next = skill.cycle();

@@ -41,6 +41,8 @@ pub struct HostConfig {
     pub persist: bool,
     /// Tournaments deal the next hand this many seconds after one ends.
     pub auto_deal_secs: u64,
+    /// New players wait until the host accepts them (returning players don't).
+    pub approve_joins: bool,
 }
 
 impl HostConfig {
@@ -59,6 +61,7 @@ impl HostConfig {
             heartbeat_secs: 5,
             persist: true,
             auto_deal_secs: 5,
+            approve_joins: false,
         }
     }
 }
@@ -70,6 +73,14 @@ struct Pending {
     contribs: BTreeMap<usize, [u8; 32]>,
     expect: Vec<usize>,
     started: Instant,
+}
+
+struct Waiting {
+    pubkey: String,
+    name: String,
+    buyin: u64,
+    enc_pub: String,
+    seen: Instant,
 }
 
 struct Frame {
@@ -104,6 +115,7 @@ pub struct Host {
     frames: VecDeque<Frame>,
     acks: AckBook,
     pending_ack: Option<Payload>,
+    waiting: Vec<Waiting>,
 }
 
 pub async fn run_host(
@@ -214,6 +226,7 @@ impl Host {
             frames: VecDeque::new(),
             acks: AckBook::new(cfg_identity),
             pending_ack: None,
+            waiting: Vec::new(),
         }
     }
 
@@ -420,7 +433,7 @@ impl Host {
                 name,
                 buyin,
                 enc_pub,
-            } => self.on_join(link, &env.from, &name, buyin, &enc_pub).await,
+            } => self.on_join_request(link, &env.from, &name, buyin, &enc_pub).await,
             Payload::Action { hand, version, mv } => {
                 let Some(seat) = seat_of else {
                     return self
@@ -501,6 +514,42 @@ impl Host {
             to: to.to_string(),
             reason: reason.to_string(),
         })?;
+        self.publish(link, &self.topics.events(), env.to_bytes()?, false).await;
+        Ok(())
+    }
+
+    fn announce_waiting(&self) {
+        let _ = self.tx.send(UiEvent::Waiting(self.waiting.iter().map(|w| w.name.clone()).collect()));
+    }
+
+    /// With approval on, strangers wait for the host; seated players walk straight back in.
+    async fn on_join_request(
+        &mut self,
+        link: &mut Link,
+        pubkey: &str,
+        name: &str,
+        buyin: u64,
+        enc_pub: &str,
+    ) -> Result<()> {
+        let known = self.table.seat_of(pubkey).is_some();
+        if !self.cfg.approve_joins || known || self.banned.contains(pubkey) {
+            return self.on_join(link, pubkey, name, buyin, enc_pub).await;
+        }
+        if let Some(w) = self.waiting.iter_mut().find(|w| w.pubkey == pubkey) {
+            w.seen = Instant::now(); // the client re-asks every couple of seconds
+        } else if self.waiting.len() < 10 {
+            self.waiting.push(Waiting {
+                pubkey: pubkey.to_string(),
+                name: sanitize_text(name, 16),
+                buyin,
+                enc_pub: enc_pub.to_string(),
+                seen: Instant::now(),
+            });
+            self.announce_waiting();
+        } else {
+            return self.send_error(link, pubkey, "too many people waiting to join").await;
+        }
+        let env = self.envelope(Payload::JoinPending { to: pubkey.to_string() })?;
         self.publish(link, &self.topics.events(), env.to_bytes()?, false).await;
         Ok(())
     }
@@ -978,6 +1027,18 @@ impl Host {
                 }
                 Ok(())
             }
+            NetCommand::Approve(accept) => {
+                if self.waiting.is_empty() {
+                    return Ok(());
+                }
+                let w = self.waiting.remove(0);
+                self.announce_waiting();
+                if accept {
+                    self.on_join(link, &w.pubkey, &w.name, w.buyin, &w.enc_pub).await
+                } else {
+                    self.reject(link, &w.pubkey, "the host declined your request to join").await
+                }
+            }
             NetCommand::Quit => Ok(()),
         }
     }
@@ -1069,6 +1130,13 @@ impl Host {
             && let Err(e) = self.finish_deal(link).await
         {
             let _ = self.tx.send(UiEvent::Error(e.to_string()));
+        }
+
+        // People who stopped asking (closed their terminal) leave the waiting list.
+        let before = self.waiting.len();
+        self.waiting.retain(|w| w.seen.elapsed() < Duration::from_secs(10));
+        if self.waiting.len() != before {
+            self.announce_waiting();
         }
 
         self.fold_kicked(link).await?;

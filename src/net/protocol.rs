@@ -38,6 +38,10 @@ pub enum Payload {
         params: TableParams,
         view: TableView,
     },
+    /// The host has your request and is deciding.
+    JoinPending {
+        to: String,
+    },
     JoinReject {
         to: String,
         reason: String,

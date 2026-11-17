@@ -7,6 +7,12 @@ import { b64uDecode, ed25519Verify, openSealed, sha256Hex } from "./crypto.js";
 export const MIN_HANDS = 50;
 export const MAX_AGE_MS = 30 * 24 * 3600 * 1000;
 const CAP_BB = 20;
+// Anti-farming: a win only earns rating from an opponent who has already played at least
+// MIN_DISTINCT *other* people, and no single opponent can ever pay out more than PAIR_CAP
+// rating points in total. One person playing themselves from several accounts gets nothing
+// from fresh accounts and a small, fixed ceiling from established ones.
+export const MIN_DISTINCT = 5;
+export const PAIR_CAP = 25;
 const USERNAME = /^[A-Za-z0-9_-]{3,16}$/;
 
 export const handHash = (b) =>
@@ -34,16 +40,43 @@ export async function checkBundle(b, now) {
 export async function applyBundle(db, b, now) {
   const ins = await db.prepare("INSERT OR IGNORE INTO hands (hand_hash, submitted_at) VALUES (?, ?)").bind(b.hand_hash, now).run();
   if ((ins.meta?.changes ?? 0) === 0) return "duplicate";
+  const score = (p) => 0.5 * Math.max(-CAP_BB, Math.min(CAP_BB, p.delta / b.bb));
+  const losers = b.players.filter((p) => p.delta < 0);
+  const lost = losers.reduce((n, p) => n - p.delta, 0);
   const stmts = [];
-  for (const p of b.players) {
-    const bb = p.delta / b.bb;
-    const score = Math.max(-CAP_BB, Math.min(CAP_BB, bb));
+  const rating = new Map(b.players.map((p) => [p.pubkey, p.delta < 0 ? score(p) : 0]));
+
+  for (const w of b.players.filter((p) => p.delta > 0)) {
+    let earned = 0;
+    for (const l of losers) {
+      const share = score(w) * (-l.delta / lost);
+      const others = await db.prepare("SELECT COUNT(*) AS n FROM pairs WHERE winner = ?1 AND loser != ?2").bind(l.pubkey, w.pubkey).first();
+      if (others.n < MIN_DISTINCT) continue; // a fresh account is not a real opponent yet
+      const row = await db.prepare("SELECT gained FROM pairs WHERE winner = ?1 AND loser = ?2").bind(w.pubkey, l.pubkey).first();
+      const credit = Math.min(share, Math.max(0, PAIR_CAP - (row?.gained ?? 0)));
+      if (credit <= 0) continue;
+      earned += credit;
+      stmts.push(
+        db.prepare(
+          `INSERT INTO pairs (winner, loser, gained) VALUES (?1, ?2, ?3)
+           ON CONFLICT(winner, loser) DO UPDATE SET gained = gained + ?3`,
+        ).bind(w.pubkey, l.pubkey, credit),
+      );
+    }
+    rating.set(w.pubkey, earned);
+  }
+  for (const x of b.players) {
+    for (const y of b.players) {
+      if (x.pubkey !== y.pubkey) {
+        stmts.push(db.prepare("INSERT OR IGNORE INTO pairs (winner, loser, gained) VALUES (?1, ?2, 0)").bind(x.pubkey, y.pubkey));
+      }
+    }
     stmts.push(
       db.prepare(
-        `INSERT INTO players (pubkey, hands, won, net_bb, rating, updated_at) VALUES (?1, 1, ?2, ?3, 1000 + 0.5 * ?4, ?5)
+        `INSERT INTO players (pubkey, hands, won, net_bb, rating, updated_at) VALUES (?1, 1, ?2, ?3, 1000 + ?4, ?5)
          ON CONFLICT(pubkey) DO UPDATE SET hands = hands + 1, won = won + ?2, net_bb = net_bb + ?3,
-           rating = rating + 0.5 * ?4, updated_at = ?5`,
-      ).bind(p.pubkey, p.delta > 0 ? 1 : 0, bb, score, now),
+           rating = rating + ?4, updated_at = ?5`,
+      ).bind(x.pubkey, x.delta > 0 ? 1 : 0, x.delta / b.bb, rating.get(x.pubkey), now),
     );
   }
   await db.batch(stmts);

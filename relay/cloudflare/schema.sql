@@ -14,4 +14,11 @@ CREATE TABLE IF NOT EXISTS hands (
   hand_hash    TEXT PRIMARY KEY,
   submitted_at INTEGER NOT NULL
 );
+-- Who has played whom (both directions), and how much rating `winner` has earned from `loser`.
+CREATE TABLE IF NOT EXISTS pairs (
+  winner TEXT NOT NULL,
+  loser  TEXT NOT NULL,
+  gained REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (winner, loser)
+);
 CREATE INDEX IF NOT EXISTS players_rating ON players (listed, rating DESC);

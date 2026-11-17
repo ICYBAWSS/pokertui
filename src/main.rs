@@ -65,6 +65,9 @@ enum Cmd {
         /// Let spectators see hole cards, this many seconds late (0 = off)
         #[arg(long, default_value_t = 0)]
         spectate_delay: u64,
+        /// New players wait until you accept them (press y / n at the table)
+        #[arg(long)]
+        approve: bool,
     },
     /// Join a table by room code (skips the menu)
     Join {
@@ -134,7 +137,7 @@ fn main() -> Result<()> {
         .context("building async runtime")?;
 
     let launch = match cli.cmd {
-        Some(Cmd::Host { name, seats, blinds, buyin, timer, no_rebuy, bots, sitngo, spectate_delay }) => {
+        Some(Cmd::Host { name, seats, blinds, buyin, timer, no_rebuy, bots, sitngo, spectate_delay, approve }) => {
             let (mut small_blind, mut big_blind) = parse_blinds(&blinds)?;
             let tourney = sitngo.then(pokertui::game::Tourney::standard);
             if let Some(t) = &tourney {
@@ -163,6 +166,7 @@ fn main() -> Result<()> {
                 auto_rebuy: !no_rebuy,
                 bots,
                 spectate_secs: spectate_delay,
+                approve_joins: approve,
             })
         }
         Some(Cmd::Join { code, name, buyin }) => {
@@ -244,13 +248,14 @@ impl Session<'_> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<NetCommand>();
         let tx = ui_tx.clone();
         let (mode, code) = match launch {
-            Launch::Host { name, params, auto_rebuy, bots, spectate_secs } => {
+            Launch::Host { name, params, auto_rebuy, bots, spectate_secs, approve_joins } => {
                 let (room, code) = roomcode::generate()?;
                 let mut cfg = HostConfig::new(self.identity.clone(), code.clone(), room, name, params);
                 cfg.broker = self.broker.clone();
                 cfg.auto_rebuy = auto_rebuy;
                 cfg.bots = bots;
                 cfg.spectate_secs = spectate_secs;
+                cfg.approve_joins = approve_joins;
                 self.runtime.spawn(async move {
                     if let Err(e) = run_host(cfg, tx.clone(), cmd_rx).await {
                         let _ = tx.send(UiEvent::Closed(format!("host stopped: {e:#}")));

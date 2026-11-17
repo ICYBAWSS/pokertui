@@ -25,6 +25,7 @@ pub enum Launch {
         auto_rebuy: bool,
         bots: Vec<Skill>,
         spectate_secs: u64,
+        approve_joins: bool,
     },
     Join {
         name: String,
@@ -304,6 +305,7 @@ impl Menu {
             auto_rebuy: false,
             bots: Vec::new(),
             spectate_secs: 0,
+            approve_joins: false,
         }))
     }
 
@@ -314,6 +316,7 @@ impl Menu {
             auto_rebuy: s.rebuy,
             bots: Vec::new(),
             spectate_secs: 0,
+            approve_joins: false,
         }))
     }
 
