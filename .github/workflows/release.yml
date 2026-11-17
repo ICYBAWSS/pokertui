@@ -18,14 +18,14 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - name: Pick the tag and create the release (no-op if it exists)
+      - name: Pick the tag and create a draft release (no-op if it exists)
         id: tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then tag="$GITHUB_REF_NAME"; else tag="v0.1.$GITHUB_RUN_NUMBER"; fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --generate-notes || true
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --generate-notes --draft || true
 
   build:
     needs: create-release
@@ -73,3 +73,12 @@ jobs:
             tar -czf "$asset" poker
           fi
           gh release upload "$TAG" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
+
+  # Only now does the release become "latest", so installers never see a half-built one.
+  publish:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ needs.create-release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --draft=false --latest
