@@ -8,7 +8,6 @@ use super::protocol::{Envelope, Payload, Topics, now_ms};
 use super::{NetCommand, UiEvent, sanitize_text};
 use crate::crypto::{Identity, b64, random_bytes};
 use crate::game::{Card, HandResult, TableParams, TableView, record_from_view, verify_record};
-use crate::leaderboard::AckBook;
 use crate::net::roomcode::RoomId;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -71,8 +70,6 @@ struct Client {
     /// The host's shuffle commitment for each upcoming hand.
     commits: HashMap<u32, String>,
     asked_commit: Option<String>,
-    acks: AckBook,
-    pending_ack: Option<Payload>,
     /// When the host first said it is deciding on our join request.
     pending_since: Option<Instant>,
 }
@@ -187,7 +184,6 @@ async fn promote(
 
 impl Client {
     fn new(cfg: ClientConfig, topics: Topics, tx: Sender<UiEvent>) -> Self {
-        let identity = cfg.identity.clone();
         Self {
             cfg,
             topics,
@@ -208,8 +204,6 @@ impl Client {
             entropy: HashMap::new(),
             commits: HashMap::new(),
             asked_commit: None,
-            acks: AckBook::new(identity),
-            pending_ack: None,
             pending_since: None,
         }
     }
@@ -402,10 +396,6 @@ impl Client {
                     self.done = Some(reason);
                 }
             }
-            Payload::ResultAck { hand_hash, sig } => {
-                self.acks.on_ack(&env.from, &hand_hash, &sig);
-                self.emit_bundles();
-            }
             Payload::Chat { from, text } => {
                 let _ = self.tx.send(UiEvent::Chat { from, text });
             }
@@ -421,20 +411,7 @@ impl Client {
             }
             _ => {}
         }
-        self.flush_ack(link).await;
         Ok(())
-    }
-
-    fn emit_bundles(&mut self) {
-        for b in self.acks.take_complete() {
-            let _ = self.tx.send(UiEvent::Bundle(b));
-        }
-    }
-
-    async fn flush_ack(&mut self, link: &mut Link) {
-        if let Some(ack) = self.pending_ack.take() {
-            self.publish(link, &self.topics.events(), ack, false).await;
-        }
     }
 
     /// The host has committed to a secret for the next shuffle: remember it and
@@ -473,12 +450,6 @@ impl Client {
         {
             self.last_result = Some(result.hand_no);
             self.audit(&view, result);
-            if !self.cfg.spectate
-                && let Some((hand_hash, sig)) = self.acks.on_result(&view)
-            {
-                self.pending_ack = Some(Payload::ResultAck { hand_hash, sig });
-                self.emit_bundles();
-            }
             let _ = self.tx.send(UiEvent::HandResult(result.clone()));
         }
         // A new turn must start with (nearly) the table's full clock; a host that
@@ -581,6 +552,10 @@ impl Client {
                 )
                 .await;
             }
+            NetCommand::Show(show) => {
+                let hand = self.view.as_ref().map(|v| v.hand_no).unwrap_or(0);
+                self.publish(link, &self.topics.events(), Payload::Show { hand, show }, false).await;
+            }
             NetCommand::Ready(ready) => {
                 self.publish(
                     link,
@@ -650,8 +625,6 @@ impl Client {
         {
             self.send_join(link).await;
         }
-
-        self.flush_ack(link).await;
 
         // Heartbeat so the host can show who is still around.
         if self.joined {

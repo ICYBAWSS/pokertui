@@ -36,8 +36,6 @@ pub enum UiEvent {
     Closed(String),
     /// This client took over as host after the old host vanished.
     Promoted,
-    /// A finished hand that every human player has co-signed (for the leaderboard).
-    Bundle(crate::leaderboard::Bundle),
     /// Players waiting for the host to let them in (names, oldest first).
     Waiting(Vec<String>),
 }
@@ -49,6 +47,8 @@ pub enum NetCommand {
     Chat(String),
     Start,
     Ready(bool),
+    /// Show (true) or muck (false) your cards after the hand.
+    Show(bool),
     Leave,
     Quit,
     /// Host only: remove a seat, optionally banning its key.

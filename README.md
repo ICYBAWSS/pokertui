@@ -143,7 +143,7 @@ alice (host)                                  bob (client)
 - **Approve joiners:** `poker host --approve` makes new players wait until you press `y` (accept) or `n` (decline). Players returning to their own seat skip it.
 - **Kick / ban:** as host press `k` (remove) or `K` (ban), then the seat number.
 - **If the host drops,** the next player takes over and the table keeps going. If *you* drop, `poker rejoin` puts you back in your seat.
-- **Rankings:** the menu or `poker rankings` shows everyone you've played with.
+- **My stats:** the menu's *My stats* screen shows every number computed from the hands you've played (win rate with its margin of error, how loose and aggressive you play, showdowns), each with its formula, plus a winnings chart, win rate by seat and a starting-hand heat map. Hands are saved to `hands.jsonl` in the data folder, on your machine only.
 - **Fair shuffle:** every player adds randomness to each deal, and every finished hand is replayed and checked by every client.
 
 More in [docs/EXPERIMENTAL_FEATURES.md](docs/EXPERIMENTAL_FEATURES.md).

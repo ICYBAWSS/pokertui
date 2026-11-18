@@ -1,8 +1,6 @@
-// pokertui relay: a Durable Object per table (message fan-out) plus the global
-// leaderboard over one more websocket endpoint. Nothing here can read a game:
-// every packet is encrypted with a key derived from the room code.
+// pokertui relay: a Durable Object per table (message fan-out). Nothing here can
+// read a game: every packet is encrypted with a key derived from the room code.
 
-import { handleFrame } from "./leaderboard.js";
 import { RoomCore } from "./room.js";
 
 export class Room {
@@ -27,24 +25,6 @@ export default {
     const room = url.pathname.match(/^\/room\/([0-9a-f]{24})$/);
     if (room && upgrade) {
       return env.ROOM.get(env.ROOM.idFromName(room[1])).fetch(request);
-    }
-    if (url.pathname === "/lb" && upgrade) {
-      const [client, server] = Object.values(new WebSocketPair());
-      server.accept();
-      // Cloudflare tells the Worker where this connection came from. Only the state
-      // name is ever stored, and only if the player opted in; never the IP.
-      const where = { region: request.cf?.region, country: request.cf?.country };
-      let frames = 0;
-      server.addEventListener("message", async (e) => {
-        if (++frames > 20) return server.close(1008, "too many frames");
-        let frame;
-        try { frame = JSON.parse(e.data); } catch { return; }
-        const reply = await handleFrame(env.DB, frame, {
-          ...where, now: Date.now(), sealSecret: env.SEAL_SECRET, sealPublic: env.SEAL_PUBLIC,
-        }).catch((err) => ({ ok: false, error: String(err.message ?? err) }));
-        server.send(JSON.stringify({ id: frame.id, ...reply }));
-      });
-      return new Response(null, { status: 101, webSocket: client });
     }
     return new Response("pokertui relay\n", { status: 200 });
   },

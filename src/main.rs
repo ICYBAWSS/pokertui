@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use pokertui::app::{App, Mode};
 use pokertui::bot::Skill;
-use pokertui::menu::{Launch, Menu, MenuOut};
+use pokertui::menu::{Launch, Menu, MenuOut, Screen};
 use pokertui::game::{TableParams, verify_record};
 use pokertui::net::{ClientConfig, HostConfig, NetCommand, UiEvent, roomcode, run_client, run_host};
 use pokertui::{art, store, ui};
@@ -88,31 +88,11 @@ enum Cmd {
     Art,
     /// Sit back down at the table you were last at (after a crash or lost connection)
     Rejoin,
-    /// Show your local rankings (everyone you have played with)
-    Rankings {
-        /// Forget all saved rankings
-        #[arg(long)]
-        reset: bool,
-        /// Show the global leaderboard instead (needs a configured relay)
-        #[arg(long)]
-        global: bool,
-    },
-    /// Opt in or out of the global leaderboard, and point at your relay
-    Leaderboard {
-        #[arg(value_parser = ["status", "on", "off", "show-state", "hide-state"], default_value = "status")]
-        action: String,
-        /// Relay address, e.g. cf+wss://pokertui-relay.you.workers.dev
-        #[arg(long)]
-        relay: Option<String>,
-        /// The relay's public key (printed by relay/cloudflare/scripts/gen-key.mjs)
-        #[arg(long)]
-        key: Option<String>,
-    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let tui = !cli.plain && !matches!(cli.cmd, Some(Cmd::Verify { .. } | Cmd::Replay { .. } | Cmd::Art | Cmd::Rankings { .. } | Cmd::Leaderboard { .. }));
+    let tui = !cli.plain && !matches!(cli.cmd, Some(Cmd::Verify { .. } | Cmd::Replay { .. } | Cmd::Art));
     init_logging(tui);
 
     match &cli.cmd {
@@ -122,8 +102,6 @@ fn main() -> Result<()> {
             print!("{}", art::LOBBY);
             return Ok(());
         }
-        Some(Cmd::Rankings { reset, global }) => return rankings(*reset, *global),
-        Some(Cmd::Leaderboard { action, relay, key }) => return leaderboard_cmd(action, relay.clone(), key.clone()),
         _ => {}
     }
 
@@ -184,25 +162,7 @@ fn main() -> Result<()> {
         _ => None,
     };
 
-    // Global leaderboard: only if a relay and its key are configured.
-    let outbox = match (&config.relay, &config.relay_key) {
-        (Some(relay), Some(key)) => {
-            let key = pokertui::leaderboard::server_key(key)?;
-            let dir = store::data_dir()?;
-            let cfg = pokertui::leaderboard::LbConfig {
-                relay: relay.clone(),
-                key,
-                identity: identity.clone(),
-                username: default_name.clone(),
-                listed: config.leaderboard,
-                show_state: config.show_state,
-            };
-            runtime.spawn(pokertui::leaderboard::uploader(dir.clone(), cfg));
-            Some((dir, key))
-        }
-        _ => None,
-    };
-    let session = Session { outbox, runtime: &runtime, identity, broker, show_art: !cli.no_art };
+    let session = Session { runtime: &runtime, identity, broker, show_art: !cli.no_art };
     let result = if cli.plain {
         let launch = launch.context("--plain needs a subcommand: host, join or spectate")?;
         let (app, rx) = session.start(launch)?;
@@ -234,7 +194,6 @@ fn init_logging(tui: bool) {
 }
 
 struct Session<'a> {
-    outbox: Option<(PathBuf, x25519_dalek::PublicKey)>,
     runtime: &'a tokio::runtime::Runtime,
     identity: Arc<pokertui::crypto::Identity>,
     broker: Option<String>,
@@ -298,8 +257,7 @@ impl Session<'_> {
             }
         };
         let mut app = App::new(mode, code, broker_display(&self.broker), cmd_tx, self.show_art);
-        app.stats = Some(pokertui::rank::Rankings::load());
-        app.outbox = self.outbox.clone();
+        app.record_stats = true;
         Ok((app, ui_rx))
     }
 }
@@ -320,72 +278,6 @@ fn parse_blinds(text: &str) -> Result<(u64, u64)> {
         bail!("blinds must be positive with big blind >= small blind");
     }
     Ok((small, big))
-}
-
-fn leaderboard_cmd(action: &str, relay: Option<String>, key: Option<String>) -> Result<()> {
-    let mut config = store::Config::load();
-    if let Some(k) = &key {
-        pokertui::leaderboard::server_key(k)?;
-    }
-    config.relay = relay.or(config.relay);
-    config.relay_key = key.or(config.relay_key);
-    match action {
-        "on" => config.leaderboard = true,
-        "off" => config.leaderboard = false,
-        "show-state" => config.show_state = true,
-        "hide-state" => config.show_state = false,
-        _ => {}
-    }
-    store::save_config(&config)?;
-    println!("username:     {}", config.name.clone().unwrap_or_else(store::default_name));
-    println!("relay:        {}", config.relay.as_deref().unwrap_or("(not set: --relay and --key)"));
-    println!("on the board: {}", if config.leaderboard { "yes" } else { "no (opt in with `poker leaderboard on`)" });
-    println!("show state:   {}", if config.show_state { "yes (guessed from your connection)" } else { "no" });
-    if let Some(status) = pokertui::leaderboard::Outbox::load_from(&store::data_dir()?).status(pokertui::net::protocol::now_ms()) {
-        println!("queue:        {status}");
-    }
-    Ok(())
-}
-
-fn rankings(reset: bool, global: bool) -> Result<()> {
-    if global {
-        let config = store::Config::load();
-        let relay = config.relay.context("no relay configured: poker leaderboard --relay URL --key KEY")?;
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        let board = rt.block_on(pokertui::leaderboard::fetch_board(
-            &store::data_dir()?,
-            &relay,
-            pokertui::net::protocol::now_ms(),
-        ))?;
-        println!("{:<5} {:<18} state", "rank", "username");
-        for r in board.rows {
-            println!("{:<5} {:<18} {}", r.rank, r.username, r.state.unwrap_or_else(|| "-".into()));
-        }
-        return Ok(());
-    }
-    if reset {
-        pokertui::rank::Rankings::default().save();
-        println!("rankings cleared");
-        return Ok(());
-    }
-    let r = pokertui::rank::Rankings::load();
-    if r.players.is_empty() {
-        println!("no rankings yet: play a few hands");
-        return Ok(());
-    }
-    println!("{:<3} {:<16} {:>6} {:>5} {:>9} {:>4}", "#", "player", "hands", "win%", "net BB", "pts");
-    for (i, (_, s)) in r.sorted().iter().enumerate() {
-        println!(
-            "{:<3} {:<16} {:>6} {:>4.0}% {:>+9.1} {:>4}",
-            i + 1,
-            s.name,
-            s.hands,
-            s.win_pct(),
-            s.net_bb,
-            s.tourney_points
-        );
-    }
-    Ok(())
 }
 
 fn verify(file: &PathBuf) -> Result<()> {
@@ -453,6 +345,7 @@ fn replay(file: &PathBuf) -> Result<()> {
 /// Menu → table → menu … in one terminal session.
 fn run_tui(session: &Session, mut pending: Option<Launch>, config: store::Config) -> Result<()> {
     let mut terminal = ratatui::init();
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::EnableMouseCapture);
     let mut menu = Menu::new(config, session.show_art);
     let result = (|| -> Result<()> {
         loop {
@@ -486,18 +379,63 @@ fn run_tui(session: &Session, mut pending: Option<Launch>, config: store::Config
             }
         }
     })();
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+/// Turn a mouse event into the key press it stands for: clicking a `[k]` label
+/// presses `k`, the wheel moves the selection. `splash` makes any click a key.
+fn mouse_key(m: ratatui::crossterm::event::MouseEvent, buf: &ratatui::buffer::Buffer, splash: bool) -> Option<ratatui::crossterm::event::KeyEvent> {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+    let code = match m.kind {
+        MouseEventKind::ScrollUp => KeyCode::Up,
+        MouseEventKind::ScrollDown => KeyCode::Down,
+        MouseEventKind::Down(MouseButton::Left) if splash => KeyCode::Enter,
+        MouseEventKind::Down(MouseButton::Left) => KeyCode::Char(click_key(buf, m.column, m.row)?),
+        _ => return None,
+    };
+    Some(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+/// The `k` of the `[k]` label under (x, y). A label's hit area runs from its
+/// `[` to the first run of three spaces after its text.
+fn click_key(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> Option<char> {
+    let area = buf.area;
+    if y < area.y || y >= area.y + area.height {
+        return None;
+    }
+    let cells: Vec<&str> = (area.x..area.x + area.width).map(|cx| buf[(cx, y)].symbol()).collect();
+    let x = x.checked_sub(area.x)? as usize;
+    let mut i = 0;
+    while i + 2 < cells.len() {
+        if cells[i] == "[" && cells[i + 2] == "]" && cells[i + 1].chars().count() == 1 {
+            let mut end = i + 3;
+            while end < cells.len() && !(cells[end..].iter().take(3).all(|c| *c == " ") && end + 3 <= cells.len()) {
+                end += 1;
+            }
+            if (i..end).contains(&x) {
+                return cells[i + 1].chars().next();
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 fn run_menu(terminal: &mut ratatui::DefaultTerminal, menu: &mut Menu) -> Result<Option<Launch>> {
     use ratatui::crossterm::event::{self, Event, KeyEventKind};
     loop {
         menu.tick += 1;
-        terminal.draw(|frame| pokertui::menu::draw(frame, menu))?;
+        let buf = terminal.draw(|frame| pokertui::menu::draw(frame, menu))?.buffer.clone();
         if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
+            && let Some(key) = match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => Some(key),
+                Event::Mouse(m) => mouse_key(m, &buf, menu.screen == Screen::Splash),
+                _ => None,
+            }
         {
             match menu.handle_key(key) {
                 Some(MenuOut::Launch(launch)) => return Ok(Some(launch)),
@@ -526,7 +464,7 @@ fn run_table(
             use std::io::Write;
             let _ = std::io::stdout().write_all(b"\x07").and_then(|_| std::io::stdout().flush());
         }
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        let buf = terminal.draw(|frame| ui::draw(frame, &app))?.buffer.clone();
         if app.quit {
             break TableExit::Quit;
         }
@@ -534,8 +472,11 @@ fn run_table(
             break TableExit::Menu(app.closed.clone());
         }
         if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
+            && let Some(key) = match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => Some(key),
+                Event::Mouse(m) => mouse_key(m, &buf, false),
+                _ => None,
+            }
         {
             app.handle_key(key);
         }
@@ -609,5 +550,24 @@ fn print_state(app: &App, view: &pokertui::game::TableView) {
             "    your cards: {}",
             app.my_cards.iter().map(|c| c.pretty()).collect::<Vec<_>>().join(" ")
         );
+    }
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::click_key;
+    use ratatui::{buffer::Buffer, layout::Rect};
+
+    #[test]
+    fn click_hits_labels_only() {
+        let mut b = Buffer::empty(Rect::new(0, 0, 40, 1));
+        b.set_string(1, 0, "[1] Fold   [2] Call 50   [3] Raise", ratatui::style::Style::default());
+        assert_eq!(click_key(&b, 2, 0), Some('1'));
+        assert_eq!(click_key(&b, 6, 0), Some('1'));
+        assert_eq!(click_key(&b, 16, 0), Some('2'));
+        assert_eq!(click_key(&b, 22, 0), Some('2'));
+        assert_eq!(click_key(&b, 9, 0), None, "gap between labels");
+        assert_eq!(click_key(&b, 30, 0), Some('3'));
+        assert_eq!(click_key(&b, 39, 0), None);
     }
 }

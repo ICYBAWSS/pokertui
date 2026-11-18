@@ -110,18 +110,6 @@ impl Tourney {
     }
 }
 
-/// Points toward the rankings for a tournament finish (1-based place).
-pub fn tourney_points(place: usize) -> u32 {
-    match place {
-        1 => 10,
-        2 => 6,
-        3 => 4,
-        4 => 2,
-        5 => 1,
-        _ => 0,
-    }
-}
-
 /// Reveal of the joint shuffle seed, published with the hand result.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SeedReveal {
@@ -173,6 +161,8 @@ pub struct Seat {
     pub last_move: Option<String>,
     pub bot: Option<Skill>,
     pub place: Option<usize>,
+    /// Chose to show their hole cards after the hand (default: muck).
+    pub shown: bool,
 }
 
 impl Seat {
@@ -196,6 +186,7 @@ impl Seat {
             last_move: None,
             bot: None,
             place: None,
+            shown: false,
         }
     }
 
@@ -235,7 +226,8 @@ pub struct SeatView {
     pub bot: bool,
     #[serde(default)]
     pub place: Option<usize>,
-    /// Hole cards shown face-up; only ever set in the delayed spectator feed.
+    /// Hole cards shown face-up: set in the delayed spectator feed, and after a hand for
+    /// players who chose to show.
     #[serde(default)]
     pub reveal: Vec<Card>,
 }
@@ -250,6 +242,11 @@ pub struct TableView {
     pub phase: Phase,
     pub street: Street,
     pub button: usize,
+    /// Seats that posted the blinds this hand.
+    #[serde(default)]
+    pub sb_seat: Option<SeatId>,
+    #[serde(default)]
+    pub bb_seat: Option<SeatId>,
     pub small_blind: u64,
     pub big_blind: u64,
     pub board: Vec<Card>,
@@ -374,6 +371,8 @@ pub struct Table {
     pub params: TableParams,
     pub seats: Vec<Option<Seat>>,
     pub button: usize,
+    sb_seat: Option<SeatId>,
+    bb_seat: Option<SeatId>,
     pub hand_no: u32,
     pub version: u64,
     pub phase: Phase,
@@ -408,6 +407,8 @@ impl Table {
             },
             seats: (0..n).map(|_| None).collect(),
             button: 0,
+            sb_seat: None,
+            bb_seat: None,
             hand_no: 0,
             version: 0,
             phase: Phase::Lobby,
@@ -524,6 +525,21 @@ impl Table {
         }
     }
 
+    /// After a hand, a player who was still in it may show their cards (muck is the default).
+    pub fn set_shown(&mut self, seat: SeatId, shown: bool) {
+        if self.phase != Phase::HandOver {
+            return;
+        }
+        if let Some(Some(s)) = self.seats.get_mut(seat)
+            && s.shown != shown
+            && !s.folded
+            && !s.hole.is_empty()
+        {
+            s.shown = shown;
+            self.bump();
+        }
+    }
+
     pub fn set_ready(&mut self, seat: SeatId, ready: bool) {
         if let Some(Some(s)) = self.seats.get_mut(seat) {
             s.ready = ready;
@@ -614,6 +630,7 @@ impl Table {
             s.folded = false;
             s.all_in = false;
             s.hole.clear();
+            s.shown = false;
             s.acted = false;
             s.can_raise = true;
             s.last_move = None;
@@ -642,6 +659,8 @@ impl Table {
             self.next_eligible_after(self.button).expect("eligible seat")
         };
         let bb = self.next_eligible_after(sb).expect("eligible seat");
+        self.sb_seat = Some(sb);
+        self.bb_seat = Some(bb);
 
         let sb_amount = self.params.small_blind;
         let bb_amount = self.params.big_blind;
@@ -731,6 +750,11 @@ impl Table {
             .filter(|(_, s)| s.in_hand() && !s.folded)
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Moves made so far this hand, in order.
+    pub fn hand_moves(&self) -> &[(SeatId, Move)] {
+        &self.moves
     }
 
     pub fn pot_total(&self) -> u64 {
@@ -1051,6 +1075,7 @@ impl Table {
         for (_, s) in self.players_mut() {
             s.bet = 0;
             s.contributed = 0;
+            s.shown = s.bot.is_some() && !s.folded && !s.hole.is_empty();
         }
         self.last_result = Some(result);
         self.phase = Phase::HandOver;
@@ -1233,6 +1258,8 @@ impl Table {
             phase: self.phase,
             street: self.street,
             button: self.button,
+            sb_seat: self.sb_seat,
+            bb_seat: self.bb_seat,
             small_blind: self.params.small_blind,
             big_blind: self.params.big_blind,
             board: self.board.clone(),
@@ -1265,7 +1292,7 @@ impl Table {
                         start_stack: self.start_stacks.get(i).copied().unwrap_or(0),
                         bot: s.bot.is_some(),
                         place: s.place,
-                        reveal: Vec::new(),
+                        reveal: if s.shown && self.phase == Phase::HandOver { s.hole.clone() } else { Vec::new() },
                     },
                     None => SeatView {
                         seat: i,
@@ -1451,9 +1478,9 @@ pub fn record_from_view(view: &TableView) -> Option<HandRecord> {
     })
 }
 
-/// Re-run the recorded moves on the committed deck and check the chip counts.
-/// A host that misreports a pot or an action fails here.
-pub fn replay_record(record: &HandRecord) -> Result<()> {
+/// Rebuild a finished hand on a fresh table and replay its moves, calling
+/// `before` with the table as it stood just before each move. Returns the final table.
+pub fn replay_steps(record: &HandRecord, mut before: impl FnMut(&Table, SeatId, &Move)) -> Result<Table> {
     use crate::crypto::b64_decode;
     let max = record.players.iter().map(|p| p.seat).max().unwrap_or(1) + 1;
     let mut t = Table::new(TableParams {
@@ -1472,12 +1499,20 @@ pub fn replay_record(record: &HandRecord) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("nonce must be 16 bytes"))?;
     t.start_hand_inner(0, record.result.deck.clone(), nonce, Some(record.result.button))?;
     for (seat, mv) in &record.result.moves {
+        before(&t, *seat, mv);
         t.apply(*seat, mv.clone(), 0)
             .map_err(|e| anyhow::anyhow!("recorded move by seat {seat} is illegal: {e}"))?;
     }
     if t.phase != Phase::HandOver {
         bail!("replayed hand did not finish");
     }
+    Ok(t)
+}
+
+/// Re-run the recorded moves on the committed deck and check the chip counts.
+/// A host that misreports a pot or an action fails here.
+pub fn replay_record(record: &HandRecord) -> Result<()> {
+    let t = replay_steps(record, |_, _, _| {})?;
     for p in record.players.iter().filter(|p| p.dealt) {
         let got = t.seats.get(p.seat).and_then(|s| s.as_ref()).map(|s| s.stack).unwrap_or(0);
         if got != p.ending_stack {
@@ -1557,6 +1592,34 @@ pub fn verify_record(record: &HandRecord) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn button_and_blinds_rotate_each_hand() {
+        let mut t = Table::new(TableParams {
+            max_seats: 4,
+            small_blind: 5,
+            big_blind: 10,
+            buyin: 1_000,
+            turn_ms: 0,
+            tourney: None,
+        });
+        for i in 0..4 {
+            t.join_bot(&format!("b{i}"), Skill::Easy).unwrap();
+        }
+        let mut seen = vec![];
+        for h in 0..5 {
+            t.start_hand(h).unwrap();
+            let v = t.view("r");
+            seen.push((v.button, v.sb_seat.unwrap(), v.bb_seat.unwrap()));
+            // Everyone folds to the big blind so the hand ends.
+            while t.phase == Phase::Betting {
+                let a = t.actor.unwrap();
+                let mv = if t.legal(a).is_some_and(|l| l.can_check) { Move::Check } else { Move::Fold };
+                t.apply(a, mv, 0).unwrap();
+            }
+        }
+        assert_eq!(seen, [(1, 2, 3), (2, 3, 0), (3, 0, 1), (0, 1, 2), (1, 2, 3)]);
+    }
+
     use super::*;
 
     fn rig(seats: usize, stack: u64) -> Table {

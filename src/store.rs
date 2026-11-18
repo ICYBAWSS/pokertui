@@ -42,13 +42,6 @@ pub struct Config {
     pub custom: Option<String>,
     /// Room code of the table you were last seated at (cleared on a deliberate leave).
     pub last_room: Option<String>,
-    /// Opt in to the public global leaderboard.
-    pub leaderboard: bool,
-    /// Opt in to showing your state (guessed from your connection) on it.
-    pub show_state: bool,
-    /// Your relay's address (`cf+wss://...`) and public key; the global leaderboard needs both.
-    pub relay: Option<String>,
-    pub relay_key: Option<String>,
 }
 
 impl Config {
@@ -79,10 +72,6 @@ fn toml_lite(text: &str) -> Config {
         match k.trim() {
             "name" | "username" if !v.is_empty() => cfg.name = Some(v),
             "last_room" if !v.is_empty() => cfg.last_room = Some(v),
-            "relay" if !v.is_empty() => cfg.relay = Some(v),
-            "relay_key" if !v.is_empty() => cfg.relay_key = Some(v),
-            "leaderboard" => cfg.leaderboard = v == "true",
-            "show_state" => cfg.show_state = v == "true",
             "broker" if !v.is_empty() => cfg.broker = Some(v),
             "custom" if !v.is_empty() => cfg.custom = Some(v),
             _ => {}
@@ -106,14 +95,6 @@ pub fn save_config(cfg: &Config) -> Result<()> {
     if let Some(room) = &cfg.last_room {
         out.push_str(&format!("last_room = \"{room}\"\n"));
     }
-    if let Some(relay) = &cfg.relay {
-        out.push_str(&format!("relay = \"{relay}\"\n"));
-    }
-    if let Some(key) = &cfg.relay_key {
-        out.push_str(&format!("relay_key = \"{key}\"\n"));
-    }
-    out.push_str(&format!("leaderboard = \"{}\"\n", cfg.leaderboard));
-    out.push_str(&format!("show_state = \"{}\"\n", cfg.show_state));
     fs::write(dir.join("config.toml"), out)?;
     Ok(())
 }

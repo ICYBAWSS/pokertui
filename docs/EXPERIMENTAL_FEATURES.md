@@ -13,10 +13,8 @@
 > | 4 | Anti-stacking (joint seed) | **Built, tested** | Host commits to a secret, every human adds randomness, and the seed is the hash of all of it. Clients check it after every hand. |
 > | 5 | Host migration | **Built, tested** | After 15 s of silence the lowest-seat connected player takes over (same room, new epoch). The interrupted hand is cancelled and stacks restored. The old host is sat out until it rejoins. |
 > | 6 | Bots | **Built, tested** | `src/bot.rs`: Easy / Medium / Hard (Monte Carlo equity). `+` adds one, `poker host --bots easy,hard`. Bots never see the deck. |
-> | 7 | Local rankings | **Built, tested** | `src/rank.rs`, menu screen and `poker rankings`. |
-> | 7b | Global leaderboard | **Built and tested in pieces, never deployed** | Worker + D1 code in `relay/cloudflare`, Rust client in `src/leaderboard.rs`. Tested against a local stand-in relay and with Rust-to-JavaScript fixtures. Not run on real Cloudflare: that needs your account. |
-> | 7c | Queue and retry when the quota is out | **Built, tested** | Outbox file, sealed to the relay key, retry at the next 00:00 UTC plus jitter. |
-> | 8 | Tournaments | **Built, tested** | Menu "Sit & Go" or `--sitngo`. Prize points feed the local rankings only. |
+> | 7, 7b, 7c | Rankings, global leaderboard, upload queue | **Removed** | Deleted on request: `src/rank.rs`, `src/leaderboard.rs`, the `poker rankings` and `poker leaderboard` commands, hand co-signing (`ResultAck`), and the Worker's `/lb` endpoint and D1 database. The sections below are the original design, kept for history. |
+> | 8 | Tournaments | **Built, tested** | Menu "Sit & Go" or `--sitngo`. Prize points are shown in the standings only. |
 > | 9 | Delayed spectating | **Built, tested** | `poker host --spectate-delay 60`. Hole cards go out only after the hand has ended. Spectators see them as face-up cards. |
 > | 10 | Cloudflare relay | **Built, tested against a stand-in** | `relay/cloudflare` plus `cf+wss://` broker URLs. Deploy steps are in its README. |
 > | 11 | Mental poker | **Library only** | `src/mental.rs` implements and tests the whole protocol (shuffle, per-card locks, private and public deals, cheat detection). It is **not wired into the live table**, so there is no "trustless deck" setting yet. |

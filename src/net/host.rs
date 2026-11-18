@@ -8,7 +8,6 @@ use super::{NetCommand, UiEvent, sanitize_text};
 use crate::bot::{self, Skill};
 use crate::crypto::{Identity, b64, b64_decode, mix_seed, parse_enc_pubkey, random_bytes, seal, seed_commit};
 use crate::game::{Card, Move, Phase, SeedReveal, Table, TableParams, TableView};
-use crate::leaderboard::AckBook;
 use crate::net::roomcode::RoomId;
 use crate::store;
 use anyhow::{Result, bail};
@@ -113,8 +112,6 @@ pub struct Host {
     tourney_start_ms: Option<u64>,
     tourney_level: usize,
     frames: VecDeque<Frame>,
-    acks: AckBook,
-    pending_ack: Option<Payload>,
     waiting: Vec<Waiting>,
 }
 
@@ -197,7 +194,6 @@ impl Host {
             cfg.auto_rebuy = false;
         }
         let table = Table::new(cfg.params.clone());
-        let cfg_identity = cfg.identity.clone();
         let seats = table.params.max_seats;
         let banned = if cfg.persist { load_bans(&cfg.code) } else { HashSet::new() };
         Self {
@@ -224,8 +220,6 @@ impl Host {
             tourney_start_ms: None,
             tourney_level: 0,
             frames: VecDeque::new(),
-            acks: AckBook::new(cfg_identity),
-            pending_ack: None,
             waiting: Vec::new(),
         }
     }
@@ -387,17 +381,7 @@ impl Host {
             }
         }
         let _ = self.tx.send(UiEvent::View(view));
-        if let Some(ack) = self.pending_ack.take() {
-            let env = self.envelope(ack)?;
-            self.publish(link, &self.topics.events(), env.to_bytes()?, false).await;
-        }
         Ok(())
-    }
-
-    fn emit_bundles(&mut self) {
-        for b in self.acks.take_complete() {
-            let _ = self.tx.send(UiEvent::Bundle(b));
-        }
     }
 
     async fn on_message(&mut self, link: &mut Link, msg: super::mqtt::Message) -> Result<()> {
@@ -456,6 +440,15 @@ impl Host {
                 }
                 Ok(())
             }
+            Payload::Show { hand, show } => {
+                if let Some(seat) = seat_of
+                    && hand == self.table.hand_no
+                {
+                    self.table.set_shown(seat, show);
+                    self.broadcast(link).await?;
+                }
+                Ok(())
+            }
             Payload::Entropy { hand, r } => {
                 if let Some(seat) = seat_of
                     && let Some(p) = self.pending.as_mut()
@@ -490,11 +483,6 @@ impl Host {
                 {
                     self.deal(link, Some(seat)).await;
                 }
-                Ok(())
-            }
-            Payload::ResultAck { hand_hash, sig } => {
-                self.acks.on_ack(&env.from, &hand_hash, &sig);
-                self.emit_bundles();
                 Ok(())
             }
             Payload::RequestState { .. } => self.broadcast(link).await,
@@ -756,12 +744,6 @@ impl Host {
             }
         }
         self.flush_kicks();
-        // Sign off on the result for the leaderboard; the ack goes out with the next broadcast.
-        let view = self.view();
-        if let Some((hand_hash, sig)) = self.acks.on_result(&view) {
-            self.pending_ack = Some(Payload::ResultAck { hand_hash, sig });
-        }
-        self.emit_bundles();
     }
 
     /// Seals hole cards to each player, or to `only` when resending.
@@ -871,6 +853,11 @@ impl Host {
         self.deal(link, None).await;
         self.last_settled = None;
         self.bot_due = None;
+        // Everyone all-in on the blinds: the hand is already over. Settle it like any
+        // other (history, rebuys, and the tournament's next deal).
+        if self.table.phase == Phase::HandOver {
+            self.settle_hand().await;
+        }
         self.broadcast(link).await
     }
 
@@ -994,6 +981,10 @@ impl Host {
             }
             NetCommand::Ready(ready) => {
                 self.table.set_ready(self.host_seat, ready);
+                self.broadcast(link).await
+            }
+            NetCommand::Show(show) => {
+                self.table.set_shown(self.host_seat, show);
                 self.broadcast(link).await
             }
             NetCommand::Leave => {

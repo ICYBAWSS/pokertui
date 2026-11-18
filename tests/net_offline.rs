@@ -4,7 +4,7 @@ mod common;
 
 use common::*;
 use pokertui::bot::Skill;
-use pokertui::game::{Phase, Tourney};
+use pokertui::game::{Move, Phase, Tourney};
 use pokertui::net::{MemoryBus, NetCommand};
 use std::sync::Arc;
 
@@ -280,49 +280,6 @@ async fn full_hand_over_the_cloudflare_relay_protocol() {
     }
 }
 
-/// Every human signs the hand; each node ends up with the same complete,
-/// verifiable bundle for the leaderboard queue.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_player_ends_up_with_the_same_cosigned_bundle() {
-    use pokertui::crypto::verify_b64;
-    let r = room(MemoryBus::new(), 3, 2_000);
-    let host = spawn_host(&r, "host", |_| {});
-    let a = spawn_client(&r, "alice", None, |_| {});
-    let b = spawn_client(&r, "bob", None, |_| {});
-    for n in [&host, &a, &b] {
-        n.set_auto(true);
-    }
-    wait_for(5.0, "seated", || seated(&host) == 3).await;
-    host.send(NetCommand::Start);
-    wait_for(10.0, "a signed bundle on every node", || {
-        [&host, &a, &b].iter().all(|n| !n.state().bundles.is_empty())
-    })
-    .await;
-    let first = host.state().bundles[0].clone();
-    assert_eq!(first.players.len(), 3);
-    for n in [&host, &a, &b] {
-        let got = n.state().bundles[0].clone();
-        assert_eq!(got.hand_hash, first.hand_hash, "{} computed a different result", n.name);
-        for p in &got.players {
-            let sig = got.sigs.get(&p.pubkey).expect("every player signed");
-            verify_b64(&p.pubkey, got.hand_hash.as_bytes(), sig).expect("valid signature");
-        }
-    }
-}
-
-/// Bot-only games and games with a single human never produce leaderboard results.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bot_games_produce_no_leaderboard_bundles() {
-    let r = room(MemoryBus::new(), 3, 2_000);
-    let host = spawn_host(&r, "host", |c| c.bots = vec![Skill::Easy, Skill::Easy]);
-    host.set_auto(true);
-    wait_for(5.0, "seated", || seated(&host) == 3).await;
-    host.send(NetCommand::Start);
-    wait_for(30.0, "a hand", || !host.state().results.is_empty()).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert!(host.state().bundles.is_empty());
-}
-
 /// With approval on, strangers wait until the host says yes; the host can decline;
 /// and a returning player is not asked again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -350,4 +307,65 @@ async fn host_approval_gates_new_players_only() {
     let alice2 = spawn_client(&r, "alice", Some(alice.id.clone()), |_| {});
     wait_for(5.0, "alice back without approval", || alice2.state().seat.is_some()).await;
     assert!(host.state().waiting.is_empty());
+}
+
+/// Rejoining while it is YOUR turn must leave you able to act.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejoin_on_your_turn_can_still_act() {
+    let r = room(MemoryBus::new(), 3, 2_000);
+    let host = spawn_host(&r, "host", |_| {});
+    let a = spawn_client(&r, "alice", None, |_| {});
+    let b = spawn_client(&r, "bob", None, |_| {});
+    wait_for(5.0, "three seated", || seated(&host) == 3).await;
+    host.set_auto(true);
+    b.set_auto(true);
+    host.send(NetCommand::Start);
+    wait_for(10.0, "alice to act", || {
+        let s = a.state();
+        s.view.as_ref().is_some_and(|v| v.phase == Phase::Betting && v.actor.is_some() && v.actor == s.seat)
+    })
+    .await;
+    let seat = a.state().seat.unwrap();
+    let hand = a.hand_no();
+    let id = a.id.clone();
+    a.send(NetCommand::Quit);
+    wait_for(2.0, "alice gone", || a.state().closed.is_some()).await;
+
+    let a2 = spawn_client(&r, "alice", Some(id), |_| {});
+    wait_for(5.0, "alice back, on the clock", || {
+        let s = a2.state();
+        s.seat == Some(seat) && s.view.as_ref().is_some_and(|v| v.actor == Some(seat) && v.actor_legal.is_some())
+    })
+    .await;
+    wait_for(5.0, "cards", || a2.state().cards.as_ref().is_some_and(|(h, _)| *h == hand)).await;
+    let v0 = a2.state().view.as_ref().unwrap().version;
+    a2.send(NetCommand::Action(Move::Call));
+    wait_for(5.0, "the table moved on after her action", || {
+        let s = a2.state();
+        s.view.as_ref().is_some_and(|v| v.version > v0 && v.actor != Some(seat))
+    })
+    .await;
+    let errs = a2.state().errors.clone();
+    println!("errors: {errs:?}");
+}
+
+/// Cards stay hidden after a hand until their owner chooses to show them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cards_are_mucked_unless_the_player_shows() {
+    let r = room(MemoryBus::new(), 3, 2_000);
+    let host = spawn_host(&r, "host", |_| {});
+    let a = spawn_client(&r, "alice", None, |_| {});
+    let b = spawn_client(&r, "bob", None, |_| {});
+    wait_for(5.0, "three seated", || seated(&host) == 3).await;
+    for n in [&host, &a, &b] {
+        n.set_auto(true);
+    }
+    host.send(NetCommand::Start);
+    wait_for(15.0, "hand over", || a.phase() == Some(Phase::HandOver)).await;
+    let (sa, sb) = (a.state().seat.unwrap(), b.state().seat.unwrap());
+    let reveal = |n: &Node, seat: usize| n.state().view.as_ref().unwrap().seats[seat].reveal.len();
+    assert_eq!((reveal(&a, sa), reveal(&b, sa), reveal(&b, sb)), (0, 0, 0), "nothing is shown by default");
+    a.send(NetCommand::Show(true));
+    wait_for(5.0, "alice's cards shown to everyone", || reveal(&b, sa) == 2 && reveal(&a, sa) == 2).await;
+    assert_eq!(reveal(&b, sb), 0, "bob still mucked");
 }

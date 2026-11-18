@@ -24,7 +24,6 @@ pub struct NodeState {
     pub closed: Option<String>,
     pub cards: Option<(u32, Vec<Card>)>,
     pub promoted: bool,
-    pub bundles: Vec<pokertui::leaderboard::Bundle>,
     pub waiting: Vec<String>,
 }
 
@@ -112,7 +111,6 @@ fn pump(rx: Receiver<UiEvent>, st: Arc<Mutex<NodeState>>, cmd: UnboundedSender<N
                 UiEvent::Error(e) => s.errors.push(e),
                 UiEvent::Info(i) => s.infos.push(i),
                 UiEvent::Promoted => s.promoted = true,
-                UiEvent::Bundle(b) => s.bundles.push(b),
                 UiEvent::Waiting(w) => s.waiting = w,
                 UiEvent::Closed(r) => {
                     s.closed.get_or_insert(r);

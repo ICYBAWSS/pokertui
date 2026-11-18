@@ -81,6 +81,11 @@ pub struct App {
     pub my_seat: Option<usize>,
     pub my_cards: Vec<Card>,
     pub my_cards_hand: u32,
+    /// After a hand: true = I chose to show, false = muck, None = not decided yet.
+    pub show_choice: Option<bool>,
+    /// Save each finished hand to the stats log (off in tests).
+    pub record_stats: bool,
+    stats_recorded: Option<u32>,
     pub log: Vec<LogLine>,
     pub input: String,
     pub chat_mode: bool,
@@ -100,6 +105,8 @@ pub struct App {
     /// Why the table closed, shown on the menu.
     pub closed: Option<String>,
     pub confirm_leave: bool,
+    /// A fold or all-in waiting for a yes.
+    pub confirm_move: Option<Move>,
     pub raise: Option<RaisePicker>,
     pub anim: Anim,
     /// Ring the terminal bell: your turn just started.
@@ -108,13 +115,9 @@ pub struct App {
     pub kick_mode: Option<bool>,
     /// Players waiting for you (the host) to let them in.
     pub waiting: Vec<String>,
-    bot_next: crate::bot::Skill,
-    /// Local rankings, updated after every hand (None disables recording).
-    pub stats: Option<crate::rank::Rankings>,
-    stats_seen: Option<u32>,
+    /// The "pick a level" prompt after `+` is open.
+    pub bot_pick: bool,
     tourney_recorded: bool,
-    /// Where co-signed hands are queued for the global leaderboard, and the relay's key.
-    pub outbox: Option<(std::path::PathBuf, x25519_dalek::PublicKey)>,
 }
 
 impl App {
@@ -133,6 +136,9 @@ impl App {
             my_seat: None,
             my_cards: Vec::new(),
             my_cards_hand: 0,
+            show_choice: None,
+            record_stats: false,
+            stats_recorded: None,
             log: Vec::new(),
             input: String::new(),
             chat_mode: false,
@@ -150,16 +156,14 @@ impl App {
             leave: false,
             closed: None,
             confirm_leave: false,
+            confirm_move: None,
             raise: None,
             anim: Anim::default(),
             bell: false,
             kick_mode: None,
             waiting: Vec::new(),
-            bot_next: crate::bot::Skill::Easy,
-            stats: None,
-            stats_seen: None,
+            bot_pick: false,
             tourney_recorded: false,
-            outbox: None,
         }
     }
 
@@ -210,14 +214,6 @@ impl App {
                 }
                 self.waiting = names;
             }
-            UiEvent::Bundle(bundle) => {
-                if let Some((dir, key)) = &self.outbox {
-                    let now = now_ms();
-                    crate::leaderboard::with_outbox(dir, |ob| {
-                        let _ = ob.push(&bundle, key, now);
-                    });
-                }
-            }
             UiEvent::Error(text) => {
                 self.push_log(LogKind::Error, text.clone());
                 self.set_notice(text);
@@ -237,15 +233,14 @@ impl App {
             self.last_message = view.message.clone();
             self.push_log(LogKind::Action, view.message.clone());
         }
-        if let Some(result) = &view.last_result
-            && self.stats_seen != Some(result.hand_no)
+        if self.record_stats
+            && self.mode != Mode::Spectator
+            && let (Some(me), Some(result)) = (self.my_seat, &view.last_result)
+            && self.stats_recorded != Some(result.hand_no)
         {
-            self.stats_seen = Some(result.hand_no);
-            if self.mode != Mode::Spectator
-                && let Some(stats) = self.stats.as_mut()
-            {
-                stats.record_hand(&view);
-                stats.save();
+            self.stats_recorded = Some(result.hand_no);
+            if let Some(h) = crate::stats::analyze(&view, me) {
+                crate::stats::append(&h);
             }
         }
         if let Some(t) = &view.tourney
@@ -253,12 +248,6 @@ impl App {
             && !self.tourney_recorded
         {
             self.tourney_recorded = true;
-            if self.mode != Mode::Spectator
-                && let Some(stats) = self.stats.as_mut()
-            {
-                stats.record_tourney(&view);
-                stats.save();
-            }
             let standings = t
                 .places
                 .iter()
@@ -278,6 +267,9 @@ impl App {
         // different hand is being played (its deal replaces them).
         if view.phase == Phase::Lobby || (view.phase == Phase::Betting && view.hand_no != self.my_cards_hand) {
             self.my_cards.clear();
+        }
+        if view.phase != Phase::HandOver {
+            self.show_choice = None;
         }
         self.note_animations(&view);
         self.view = Some(view);
@@ -471,18 +463,14 @@ impl App {
         let cmd = parts.next().unwrap_or("").to_lowercase();
         let arg = parts.next().unwrap_or("").trim();
         match cmd.as_str() {
-            "f" | "fold" => {
-                let _ = self.net.send(NetCommand::Action(Move::Fold));
-            }
+            "f" | "fold" => self.ask(Move::Fold),
             "x" | "check" => {
                 let _ = self.net.send(NetCommand::Action(Move::Check));
             }
             "c" | "call" => {
                 let _ = self.net.send(NetCommand::Action(Move::Call));
             }
-            "a" | "allin" | "all-in" => {
-                let _ = self.net.send(NetCommand::Action(Move::AllIn));
-            }
+            "a" | "allin" | "all-in" => self.ask(Move::AllIn),
             "b" | "bet" | "r" | "raise" => match arg.parse::<u64>() {
                 Ok(to) => {
                     let _ = self.net.send(NetCommand::Action(Move::Raise { to }));
@@ -510,12 +498,38 @@ impl App {
         }
     }
 
+    /// Fold and all-in can't be undone: ask first.
+    fn ask(&mut self, mv: Move) {
+        if self.my_turn() {
+            self.confirm_move = Some(mv);
+        } else {
+            self.send(mv);
+        }
+    }
+
     fn open_raise(&mut self) {
         match self.raise_presets() {
             Some(p) => self.raise = Some(RaisePicker { amount: p[0].1, typed: None }),
             None if self.my_turn() => self.set_notice("can't raise"),
             None => self.set_notice("not your turn"),
         }
+    }
+
+    /// After a hand I was still in (or won uncontested): offer show / muck.
+    pub fn can_show(&self) -> bool {
+        let (Some(view), Some(me)) = (&self.view, self.my_seat) else { return false };
+        if view.phase != Phase::HandOver || self.mode == Mode::Spectator || self.my_cards.len() != 2 {
+            return false;
+        }
+        let Some(result) = &view.last_result else { return false };
+        let in_it = result.reveals.iter().any(|r| r.seat == me) || result.pots.iter().any(|p| p.winners.contains(&me));
+        in_it && view.seats.get(me).is_some_and(|s| !s.folded)
+    }
+
+    fn choose_show(&mut self, show: bool) {
+        self.show_choice = Some(show);
+        let _ = self.net.send(NetCommand::Show(show));
+        self.set_notice(if show { "showing your cards" } else { "mucked" });
     }
 
     fn can_deal(&self) -> bool {
@@ -530,6 +544,27 @@ impl App {
         }
         if self.help {
             self.help = false;
+            return true;
+        }
+        if self.bot_pick {
+            self.bot_pick = false;
+            use crate::bot::Skill;
+            let skill = match key.code {
+                KeyCode::Char('e' | 'E' | '1') => Some(Skill::Easy),
+                KeyCode::Char('m' | 'M' | '2') => Some(Skill::Medium),
+                KeyCode::Char('h' | 'H' | '3') => Some(Skill::Hard),
+                _ => None,
+            };
+            if let Some(skill) = skill {
+                let _ = self.net.send(NetCommand::AddBot(skill));
+                self.set_notice(format!("added a {} bot", skill.label()));
+            }
+            return true;
+        }
+        if let Some(mv) = self.confirm_move.take() {
+            if matches!(key.code, KeyCode::Char('y' | 'Y') | KeyCode::Enter) {
+                self.send(mv);
+            }
             return true;
         }
         if self.confirm_leave {
@@ -578,10 +613,12 @@ impl App {
             KeyCode::Char(c @ ('y' | 'n')) if self.mode == Mode::Host && !self.waiting.is_empty() => {
                 let _ = self.net.send(NetCommand::Approve(c == 'y'));
             }
-            KeyCode::Char('+') if self.mode == Mode::Host => {
-                let skill = self.bot_next;
-                self.bot_next = skill.cycle();
-                let _ = self.net.send(NetCommand::AddBot(skill));
+            KeyCode::Char('+' | '=') if self.mode == Mode::Host => {
+                if self.view.as_ref().is_some_and(|v| v.phase == Phase::Betting) {
+                    self.set_notice("bots can sit down between hands: press + when this one ends");
+                } else {
+                    self.bot_pick = true;
+                }
             }
             KeyCode::Char(c @ ('k' | 'K')) if self.mode == Mode::Host => {
                 self.kick_mode = Some(c == 'K');
@@ -594,9 +631,11 @@ impl App {
                 let _ = self.net.send(NetCommand::Ready(true));
                 self.set_notice("sitting back in");
             }
+            KeyCode::Char('s') if self.can_show() && self.show_choice.is_none() => self.choose_show(true),
+            KeyCode::Char('m') if self.can_show() && self.show_choice.is_none() => self.choose_show(false),
             KeyCode::Esc | KeyCode::Char('q') => self.confirm_leave = true,
-            KeyCode::Char('1') | KeyCode::Char('f') => self.send(Move::Fold),
-            KeyCode::Char('2') => {
+            KeyCode::Char('f') => self.ask(Move::Fold),
+            KeyCode::Char('c') => {
                 let mv = match self.my_legal() {
                     Some(l) if l.can_check => Move::Check,
                     _ => Move::Call,
@@ -604,9 +643,13 @@ impl App {
                 self.send(mv);
             }
             KeyCode::Char('x') => self.send(Move::Check),
-            KeyCode::Char('c') => self.send(Move::Call),
-            KeyCode::Char('3') | KeyCode::Char('r') | KeyCode::Char('b') => self.open_raise(),
-            KeyCode::Char('4') | KeyCode::Char('a') => self.send(Move::AllIn),
+            KeyCode::Char('r') | KeyCode::Char('b') => self.open_raise(),
+            // Typing a number starts a bet straight away.
+            KeyCode::Char('0'..='9') if self.raise_presets().is_some() => {
+                self.open_raise();
+                self.key_raise(key);
+            }
+            KeyCode::Char('a') => self.ask(Move::AllIn),
             KeyCode::Char('t') | KeyCode::Char('/') => self.chat_mode = true,
             KeyCode::Char('?') | KeyCode::Char('h') => self.help = true,
             KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('d') if self.can_deal() => {

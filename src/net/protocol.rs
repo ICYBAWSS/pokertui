@@ -65,6 +65,11 @@ pub enum Payload {
     Ready {
         ready: bool,
     },
+    /// After a hand: show (or muck) my hole cards.
+    Show {
+        hand: u32,
+        show: bool,
+    },
     RequestState {
         version: u64,
     },
@@ -87,11 +92,6 @@ pub enum Payload {
         to: String,
         reason: String,
         ban: bool,
-    },
-    /// A player's signature over the result of the hand that just finished.
-    ResultAck {
-        hand_hash: String,
-        sig: String,
     },
     /// One frame of the delayed spectator feed (hole cards revealed).
     Delayed {

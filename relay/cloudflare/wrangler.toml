@@ -10,17 +10,3 @@ class_name = "Room"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Room"]
-
-# Global leaderboard. Create it with:  wrangler d1 create pokertui-leaderboard
-# then paste the database_id it prints, and run:  wrangler d1 execute pokertui-leaderboard --remote --file schema.sql
-[[d1_databases]]
-binding = "DB"
-database_name = "pokertui-leaderboard"
-database_id = "REPLACE_WITH_YOUR_D1_ID"
-
-# Secrets (never commit them):
-#   node scripts/gen-key.mjs                 prints a keypair
-#   wrangler secret put SEAL_SECRET          paste the secret
-# and set the public half so the Worker can derive shared keys:
-[vars]
-SEAL_PUBLIC = "REPLACE_WITH_PUBLIC_KEY"

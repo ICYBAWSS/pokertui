@@ -7,10 +7,10 @@ use crate::bot::Skill;
 use crate::game::TableParams;
 use crate::net::roomcode;
 use crate::store::{self, Config};
-use crate::ui::{DIM, GOLD, RED, TEXT, YOU, centered};
+use crate::ui::{DIM, GOLD, RED, TEXT, YOU, popup};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
@@ -148,7 +148,9 @@ const F_BB: usize = 2;
 const F_SEATS: usize = 3;
 const F_TIMER: usize = 4;
 const F_REBUY: usize = 5;
-const FIELDS: usize = 6;
+const F_BOTS: usize = 6;
+const F_SKILL: usize = 7;
+const FIELDS: usize = 8;
 
 /// Half of the leading power of ten: 25 → 5, 5,000 → 500.
 fn step(v: u64) -> u64 {
@@ -186,7 +188,7 @@ pub enum Screen {
     Settings,
     JoinCode,
     WatchCode,
-    Rankings,
+    Stats,
 }
 
 /// Entries on the main menu, in display order.
@@ -196,7 +198,7 @@ pub enum MainItem {
     Host,
     Join,
     Watch,
-    Rankings,
+    Stats,
     Username,
     Quit,
 }
@@ -208,7 +210,11 @@ pub struct Menu {
     pub tick: u64,
     pub sel: usize,
     pub input: String,
+    pub stats: crate::stats_ui::StatsScreen,
     pub settings: Settings,
+    /// Bots to seat at the table (host only) and how good they are.
+    pub bots: usize,
+    pub bot_skill: Skill,
     pub field: usize,
     /// Digits typed into the active settings field (None = not typing).
     pub typed: Option<String>,
@@ -216,11 +222,6 @@ pub struct Menu {
     pub notice: Option<String>,
     pub show_art: bool,
     pub config: Config,
-    pub rankings: crate::rank::Rankings,
-    /// 0 = people you've played, 1 = the global board.
-    pub rank_tab: usize,
-    pub global: Option<crate::leaderboard::Board>,
-    pub lb_status: Option<String>,
 }
 
 impl Menu {
@@ -233,17 +234,16 @@ impl Menu {
             tick: 0,
             sel: 0,
             input: String::new(),
+            stats: crate::stats_ui::StatsScreen { hands: Vec::new(), tab: 0, scroll: 0, filter: crate::stats_ui::Filter::All, formulas: false, lines: crate::stats_ui::DEFAULT_LINES },
             settings: PRESETS[0].settings,
+            bots: 0,
+            bot_skill: Skill::Medium,
             field: 0,
             typed: None,
             hint: None,
             notice: None,
             show_art,
             config,
-            rankings: crate::rank::Rankings::default(),
-            rank_tab: 0,
-            global: None,
-            lb_status: None,
         }
     }
 
@@ -252,7 +252,7 @@ impl Menu {
         if let Some(code) = &self.config.last_room {
             items.push(MainItem::Rejoin(code.clone()));
         }
-        items.extend([MainItem::Host, MainItem::Join, MainItem::Watch, MainItem::Rankings, MainItem::Username, MainItem::Quit]);
+        items.extend([MainItem::Host, MainItem::Join, MainItem::Watch, MainItem::Stats, MainItem::Username, MainItem::Quit]);
         items
     }
 
@@ -314,7 +314,7 @@ impl Menu {
             name: self.name(),
             params: s.params(),
             auto_rebuy: s.rebuy,
-            bots: Vec::new(),
+            bots: vec![self.bot_skill; self.bots.min(s.seats.saturating_sub(1))],
             spectate_secs: 0,
             approve_joins: false,
         }))
@@ -341,11 +341,9 @@ impl Menu {
             Screen::GameType => self.key_game_type(key),
             Screen::Settings => self.key_settings(key),
             Screen::JoinCode | Screen::WatchCode => self.key_code(key),
-            Screen::Rankings => {
-                match key.code {
-                    KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.rank_tab = 1 - self.rank_tab,
-                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.go(Screen::Main),
-                    _ => {}
+            Screen::Stats => {
+                if self.stats.handle_key(key) {
+                    self.go(Screen::Main);
                 }
                 None
             }
@@ -386,7 +384,7 @@ impl Menu {
                 '1' => MainItem::Host,
                 '2' => MainItem::Join,
                 '3' => MainItem::Watch,
-                '4' => MainItem::Rankings,
+                '4' => MainItem::Stats,
                 '5' => MainItem::Username,
                 _ => return None,
             };
@@ -416,15 +414,9 @@ impl Menu {
             Some(MainItem::Host) => self.go(Screen::GameType),
             Some(MainItem::Join) => self.go(Screen::JoinCode),
             Some(MainItem::Watch) => self.go(Screen::WatchCode),
-            Some(MainItem::Rankings) => {
-                self.rankings = crate::rank::Rankings::load();
-                if let Ok(dir) = store::data_dir() {
-                    self.global = crate::leaderboard::cached_board(&dir);
-                    self.lb_status = crate::leaderboard::Outbox::load_from(&dir)
-                        .status(crate::net::protocol::now_ms());
-                }
-                self.rank_tab = 0;
-                self.go(Screen::Rankings);
+            Some(MainItem::Stats) => {
+                self.stats = crate::stats_ui::StatsScreen::load();
+                self.go(Screen::Stats);
             }
             Some(MainItem::Username) => self.go(Screen::Name),
             Some(MainItem::Quit) => return Some(MenuOut::Quit),
@@ -480,7 +472,7 @@ impl Menu {
             }
             KeyCode::Left => self.adjust(-1),
             KeyCode::Right => self.adjust(1),
-            KeyCode::Char(' ') if self.field == F_REBUY => self.adjust(1),
+            KeyCode::Char(' ') if matches!(self.field, F_REBUY | F_SKILL) => self.adjust(1),
             KeyCode::Char(c @ '0'..='9') => self.type_digit(c),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Enter => match self.settings.problem() {
@@ -521,6 +513,8 @@ impl Menu {
                 s.timer_s = TIMERS[(i + dir).clamp(0, TIMERS.len() as i64 - 1) as usize];
             }
             F_REBUY => s.rebuy = !s.rebuy,
+            F_BOTS => self.bots = (self.bots as i64 + dir).clamp(0, s.seats as i64 - 1) as usize,
+            F_SKILL => self.bot_skill = self.bot_skill.cycle(),
             _ => {}
         }
     }
@@ -595,30 +589,29 @@ pub fn draw(f: &mut Frame, m: &Menu) {
     f.render_widget(Block::default().style(Style::default().bg(Color::Black)), area);
     if area.width < 44 || area.height < 16 {
         f.render_widget(
-            Paragraph::new("♠ POKER · make the terminal bigger").alignment(Alignment::Center).style(Style::default().fg(GOLD)),
+            Paragraph::new("POKERTUI · make the terminal bigger").alignment(Alignment::Center).style(Style::default().fg(GOLD)),
             area,
         );
         return;
     }
     draw_marquee(f, area, m.tick);
-    let inner = Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(2));
+    let [_, inner, _] = Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).areas(area);
 
     if m.screen == Screen::Splash {
         draw_splash(f, inner, m);
         return;
     }
-
-    // Title: wordmark when there's room, compact otherwise.
-    let (ww, wh) = art::dimensions(art::WORDMARK);
-    let big = m.show_art && inner.width >= ww + 2 && inner.height >= wh + 16;
-    let title_h = if big { wh + 1 } else { 2 };
-    if big {
-        draw_wordmark(f, Rect::new(inner.x, inner.y + 1, inner.width, wh), m.tick);
-    } else {
-        let line = Line::from(Span::styled("♠  P O K E R  ♥", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)));
-        f.render_widget(Paragraph::new(line).alignment(Alignment::Center), Rect::new(inner.x, inner.y, inner.width, 1));
+    if m.screen == Screen::Stats {
+        crate::stats_ui::draw(f, inner, &m.stats);
+        return;
     }
-    let body = Rect::new(inner.x, inner.y + title_h + 1, inner.width, inner.height.saturating_sub(title_h + 1));
+
+    // The same title as the splash screen, so every screen matches.
+    let (_, ah) = art::dimensions(art::SPLASH);
+    let big = title_fits(inner, m.show_art, 16);
+    let title_h = if big { ah + 1 } else { 2 };
+    let [head, body] = Layout::vertical([Constraint::Length(title_h + 1), Constraint::Min(0)]).areas(inner);
+    draw_title(f, Rect { y: head.y + big as u16, height: title_h, ..head }, big);
 
     let (title, lines, footer) = match m.screen {
         Screen::Name => name_panel(m),
@@ -626,14 +619,13 @@ pub fn draw(f: &mut Frame, m: &Menu) {
         Screen::GameType => game_type_panel(m),
         Screen::Settings => settings_panel(m),
         Screen::JoinCode | Screen::WatchCode => code_panel(m),
-        Screen::Rankings => rankings_panel(m),
-        Screen::Splash => unreachable!(),
+        Screen::Splash | Screen::Stats => unreachable!(),
     };
     // Panels slide up a couple of rows when they open.
     let rise = 2 - (anim::ease_out(anim::progress(m.screen_at, Duration::from_millis(180))) * 2.0) as u16;
     let h = (lines.len() as u16 + 2).min(body.height);
     let w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(20).max(title.len() as u16 + 4) + 6;
-    let mut rect = centered(Rect::new(body.x, body.y, body.width, body.height.saturating_sub(2)), w, h);
+    let mut rect = popup(Rect::new(body.x, body.y, body.width, body.height.saturating_sub(2)), w, h);
     rect.y = (rect.y + rise).min(body.y + body.height.saturating_sub(h));
     rect.y = rect.y.min(body.y + 1).max(body.y);
     f.render_widget(Clear, rect);
@@ -655,10 +647,8 @@ pub fn draw(f: &mut Frame, m: &Menu) {
             Rect::new(body.x, below + 1, body.width, 1),
         );
     }
-    f.render_widget(
-        Paragraph::new(Span::styled(footer, Style::default().fg(DIM))).alignment(Alignment::Center),
-        Rect::new(inner.x, inner.y + inner.height.saturating_sub(1), inner.width, 1),
-    );
+    let [_, foot] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    f.render_widget(Paragraph::new(Span::styled(footer, Style::default().fg(DIM))).alignment(Alignment::Center), foot);
 }
 
 fn draw_marquee(f: &mut Frame, area: Rect, tick: u64) {
@@ -687,76 +677,137 @@ fn draw_marquee(f: &mut Frame, area: Rect, tick: u64) {
     }
 }
 
-fn draw_wordmark(f: &mut Frame, area: Rect, tick: u64) {
-    let lines = art::lines(art::WORDMARK);
-    let (w, _) = art::dimensions(art::WORDMARK);
-    let x0 = area.x + area.width.saturating_sub(w) / 2;
-    let buf = f.buffer_mut();
-    for (row, line) in lines.iter().enumerate() {
-        if row as u16 >= area.height {
-            break;
+/// Whether the big title art fits above `below` rows of other content.
+fn title_fits(area: Rect, show_art: bool, below: u16) -> bool {
+    let (aw, ah) = art::dimensions(art::SPLASH);
+    show_art && area.width >= aw + 2 && area.height >= ah + below
+}
+
+/// The game's title: the big art when `big`, otherwise one line of text.
+fn draw_title(f: &mut Frame, area: Rect, big: bool) {
+    if big {
+        let (aw, _) = art::dimensions(art::SPLASH);
+        let ax = area.x + area.width.saturating_sub(aw) / 2;
+        let buf = f.buffer_mut();
+        for (i, line) in art::lines(art::SPLASH).iter().enumerate() {
+            buf.set_string(ax, area.y + i as u16, line, Style::default().fg(TEXT));
         }
-        for (col, ch) in line.chars().enumerate() {
-            if ch == ' ' {
-                continue;
-            }
-            let x = x0 + col as u16;
-            if x >= area.x + area.width {
-                break;
-            }
-            let color = if ch == '█' { anim::shimmer(col as u16 + row as u16, w, tick) } else { Color::Rgb(120, 90, 40) };
-            buf.set_string(x, area.y + row as u16, ch.to_string(), Style::default().fg(color));
-        }
+    } else {
+        let t = Span::styled("P O K E R T U I", Style::default().fg(TEXT).add_modifier(Modifier::BOLD));
+        f.render_widget(Paragraph::new(t).alignment(Alignment::Center), Rect::new(area.x, area.y, area.width, 1));
     }
 }
 
 fn draw_splash(f: &mut Frame, area: Rect, m: &Menu) {
-    let (ww, wh) = art::dimensions(art::WORDMARK);
-    let big = m.show_art && area.width >= ww + 2 && area.height >= wh + 12;
-    let block_h = if big { wh + 10 } else { 10 };
-    let top = area.y + area.height.saturating_sub(block_h) / 2;
-    if big {
-        draw_wordmark(f, Rect::new(area.x, top, area.width, wh), m.tick);
-    } else {
-        let line = Line::from(Span::styled("♠  P O K E R  ♥", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)));
-        f.render_widget(Paragraph::new(line).alignment(Alignment::Center), Rect::new(area.x, top + 2, area.width, 1));
-    }
-    let sub_y = top + if big { wh + 1 } else { 4 };
+    let (_, ah) = art::dimensions(art::SPLASH);
+    let big = title_fits(area, m.show_art, 4);
+    let title_h = if big { ah } else { 1 };
+    const W: u16 = 11;
+    const GAP: u16 = 2;
+    const SLOTS: usize = 5; // player, player, POT, player, player
+    const ROWS: u16 = 12; // tallest stack plus the arc of a flying chip
+    let fits_w = (area.width + GAP) / (W + GAP) >= SLOTS as u16;
+    let block_h = title_h + 1 + ROWS + 3;
+    let chips_h = if fits_w && area.height >= block_h { ROWS } else { 0 };
+    let block_h = if chips_h > 0 { block_h } else { title_h + 2 };
+    let mut y = area.y + area.height.saturating_sub(block_h) / 2;
+    draw_title(f, Rect::new(area.x, y, area.width, title_h), big);
+    y += title_h + 1;
+    if chips_h > 0 {
+        let floor = y + chips_h; // first row below the stacks
+        let total_w = SLOTS as u16 * W + (SLOTS as u16 - 1) * GAP;
+        let x0 = area.x + (area.width - total_w) / 2;
+        let xs = |slot: usize| (x0 + slot as u16 * (W + GAP)) as f64;
 
-    // Riffle: seven cards fan out from the middle.
-    const CARDS: [(&str, bool); 7] =
-        [("A♠", false), ("K♥", true), ("Q♣", false), ("J♦", true), ("T♠", false), ("9♥", true), ("8♣", false)];
-    let p = anim::ease_out(anim::progress(m.started, Duration::from_millis(900)));
-    let cy = sub_y + 2;
-    let cx = area.x + area.width / 2;
-    let buf = f.buffer_mut();
-    for (i, (label, red)) in CARDS.iter().enumerate() {
-        let offset = (i as f32 - 3.0) * 8.0 * p;
-        let x = (cx as f32 + offset - 3.0).max(area.x as f32) as u16;
-        // Lift the middle cards a touch for an arc.
-        let lift = ((3.0 - (i as f32 - 3.0).abs()) * p * 0.4) as u16;
-        let y = cy + 1 - lift.min(1);
-        if x + 7 > area.x + area.width {
-            continue;
+        // Idle loop: once a second a random stack gains or loses a few chips, and the chips fly
+        // out to the screen edge or in from it. Like a real rack, every stack is one denomination
+        // (colour). State is replayed from a fixed seed, so it is deterministic.
+        const FLY_TICKS: f32 = 14.0;
+        let palette = [Color::Rgb(215, 215, 215), RED, Color::Rgb(40, 110, 200), Color::Rgb(40, 150, 80), Color::Rgb(150, 80, 200)];
+        let mut st: Vec<Vec<Color>> = (0..SLOTS).map(|s| vec![palette[s % 5]; 3 + s % 3]).collect();
+        // Applies event `n`; returns (slot, chips added) (negative = removed).
+        let step = |st: &mut Vec<Vec<Color>>, n: u64| -> (usize, i32) {
+            let r = (n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 33) as usize;
+            let (s, c) = (r % SLOTS, 1 + (r >> 8) % 4);
+            let len = st[s].len();
+            if len >= 9 || (len > 1 && (r >> 16) % 2 == 0) {
+                let c = c.min(len - 1);
+                st[s].truncate(len - c);
+                (s, -(c as i32))
+            } else {
+                let c = c.min(9 - len);
+                st[s].extend(std::iter::repeat_n(palette[s % 5], c));
+                (s, c as i32)
+            }
+        };
+        let event = m.tick / 20;
+        for n in 1..event {
+            step(&mut st, n);
         }
-        let border = Style::default().fg(Color::Rgb(190, 195, 190)).bg(Color::Black);
-        let face = Style::default().fg(if *red { RED } else { TEXT }).bg(Color::Black).add_modifier(Modifier::BOLD);
-        buf.set_string(x, y, "┌─────┐", border);
-        buf.set_string(x, y + 1, "│     │", border);
-        buf.set_string(x + 2, y + 1, *label, face);
-        buf.set_string(x, y + 2, "│     │", border);
-        buf.set_string(x, y + 3, "└─────┘", border);
+        let mut flying: Vec<(f32, f32, Color)> = Vec::new();
+        if event > 0 {
+            let before = st.clone();
+            let (slot, delta) = step(&mut st, event);
+            let t = (m.tick % 20) as f32 / FLY_TICKS;
+            if t < 1.0 {
+                let (lo, hi) = (before[slot].len().min(st[slot].len()), before[slot].len().max(st[slot].len()));
+                let edge = if slot < SLOTS / 2 { area.x as f32 - W as f32 } else { (area.x + area.width) as f32 }; // fully off screen
+                // Each chip leaves its stack the moment it launches (top chip first) and joins
+                // the stack the moment it lands (bottom chip first), so nothing ever pops.
+                let mut shown = if delta < 0 { hi } else { lo };
+                for k in lo..hi {
+                    let i = if delta < 0 { hi - 1 - k } else { k - lo };
+                    let raw = (t - i as f32 * 0.12) / (1.0 - 0.12 * 3.0);
+                    let tt = anim::ease_out(raw.clamp(0.0, 1.0));
+                    let (home_x, home_y) = (xs(slot) as f32, (floor - 1 - k as u16) as f32);
+                    // Leaving: home → edge. Arriving: edge → home.
+                    let p = if delta < 0 { tt } else { 1.0 - tt };
+                    if delta < 0 && raw > 0.0 {
+                        shown -= 1; // lifted off
+                    } else if delta > 0 && raw >= 1.0 {
+                        shown += 1; // landed
+                    }
+                    if delta < 0 && raw <= 0.0 || delta > 0 && raw >= 1.0 {
+                        continue; // still on the stack
+                    }
+                    let x = home_x + (edge - home_x) * p;
+                    let y = home_y - (std::f32::consts::PI * p).sin() * 5.0;
+                    flying.push((x, y, palette[slot % 5]));
+                }
+                let mut base = if delta < 0 { before[slot].clone() } else { st[slot].clone() };
+                base.truncate(shown);
+                st[slot] = base;
+            }
+        }
+        let buf = f.buffer_mut();
+        for (slot, chips) in st.iter().enumerate() {
+            let x = xs(slot) as u16;
+            for (k, c) in chips.iter().enumerate() {
+                buf.set_string(x, floor - 1 - k as u16, "▐▓░▓░▓░▓░▓▌", Style::default().fg(*c));
+            }
+            if let Some(top) = chips.last() {
+                buf.set_string(x, floor - 1 - chips.len() as u16, "▗▄▄▄▄▄▄▄▄▄▖", Style::default().fg(*top));
+            }
+        }
+        for (x, y, c) in flying {
+            if y < area.y as f32 {
+                continue;
+            }
+            // Draw cell by cell so a chip sliding off the edge is clipped, not stuck.
+            for (i, ch) in "▐▓░▓░▓░▓░▓▌".chars().enumerate() {
+                let cx = x.round() as i32 + i as i32;
+                if (area.x as i32..(area.x + area.width) as i32).contains(&cx) {
+                    buf.set_string(cx as u16, y.round() as u16, ch.to_string(), Style::default().fg(c));
+                }
+            }
+        }
+        y = floor + 2;
     }
-
-    if p >= 1.0 {
-        let glow = anim::pulse(m.tick);
-        let v = (120.0 + 135.0 * glow) as u8;
-        f.render_widget(
-            Paragraph::new(Span::styled("press any key", Style::default().fg(Color::Rgb(v, v, v))))
-                .alignment(Alignment::Center),
-            Rect::new(area.x, cy + 6, area.width, 1),
-        );
-    }
+    let lines = vec![
+        Line::from(Span::styled("press any key", Style::default().fg(DIM))),
+    ];
+    let [hint] = Layout::vertical([Constraint::Length(1)]).areas(Rect { y, height: 1, ..area });
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), hint);
 }
 
 fn item(m: &Menu, idx: usize, key: &str, label: &str, desc: &str) -> Line<'static> {
@@ -795,10 +846,6 @@ fn name_panel(m: &Menu) -> Panel {
         lines.push(Line::from(Span::styled(format!("  {h}"), Style::default().fg(RED))));
     }
     lines.push(Line::from(Span::styled(
-        "   Shown on the public leaderboard.",
-        Style::default().fg(DIM),
-    )));
-    lines.push(Line::from(Span::styled(
         "   Don't use your real name.",
         Style::default().fg(DIM),
     )));
@@ -821,7 +868,7 @@ fn main_panel(m: &Menu) -> Panel {
             MainItem::Host => { n += 1; (n.to_string(), "Host a table".into(), String::new()) }
             MainItem::Join => { n += 1; (n.to_string(), "Join a table".into(), String::new()) }
             MainItem::Watch => { n += 1; (n.to_string(), "Watch a table".into(), String::new()) }
-            MainItem::Rankings => { n += 1; (n.to_string(), "Rankings".into(), String::new()) }
+            MainItem::Stats => { n += 1; (n.to_string(), "My stats".into(), String::new()) }
             MainItem::Username => { n += 1; (n.to_string(), "Change username".into(), String::new()) }
             MainItem::Quit => ("Q".to_string(), "Quit".into(), String::new()),
         };
@@ -829,71 +876,6 @@ fn main_panel(m: &Menu) -> Panel {
     }
     lines.push(Line::from(""));
     ("MAIN MENU", lines, "↑↓ · Enter")
-}
-
-fn global_panel(m: &Menu) -> Panel {
-    let mut lines = vec![Line::from(Span::styled(
-        format!("  {:<5} {:<18} {}", "rank", "username", "state"),
-        Style::default().fg(DIM),
-    ))];
-    match &m.global {
-        Some(board) if !board.rows.is_empty() => {
-            for r in board.rows.iter().take(12) {
-                lines.push(Line::from(Span::styled(
-                    format!("  {:<5} {:<18} {}", r.rank, truncate_name(&r.username, 18), r.state.clone().unwrap_or_else(|| "—".into())),
-                    Style::default().fg(TEXT),
-                )));
-            }
-        }
-        Some(_) => lines.push(Line::from(Span::styled("  Nobody has 50 hands yet.", Style::default().fg(DIM)))),
-        None => {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("  Not loaded. Run: poker rankings --global", Style::default().fg(DIM))));
-        }
-    }
-    if let Some(s) = &m.lb_status {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(format!("  {s}"), Style::default().fg(GOLD))));
-    }
-    lines.push(Line::from(""));
-    ("RANKINGS · everyone", lines, "Tab switch · Esc back")
-}
-
-fn rankings_panel(m: &Menu) -> Panel {
-    if m.rank_tab == 1 {
-        return global_panel(m);
-    }
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("  {:<3} {:<16} {:>6} {:>5} {:>8} {:>4}", "#", "player", "hands", "win%", "net BB", "pts"),
-            Style::default().fg(DIM),
-        )),
-    ];
-    let rows = m.rankings.sorted();
-    if rows.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("  Nobody yet. Play a few hands.", Style::default().fg(DIM))));
-    }
-    for (i, (_, s)) in rows.iter().take(12).enumerate() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  {:<3} {:<16} {:>6} {:>4.0}% {:>+8.1} {:>4}",
-                i + 1,
-                truncate_name(&s.name, 16),
-                s.hands,
-                s.win_pct(),
-                s.net_bb,
-                s.tourney_points
-            ),
-            Style::default().fg(TEXT),
-        )));
-    }
-    lines.push(Line::from(""));
-    ("RANKINGS · people you've played", lines, "Tab for everyone · Esc back")
-}
-
-fn truncate_name(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
 }
 
 fn game_type_panel(m: &Menu) -> Panel {
@@ -927,6 +909,8 @@ fn settings_panel(m: &Menu) -> Panel {
         ("Seats", value(F_SEATS, s.seats.to_string())),
         ("Turn timer", value(F_TIMER, if s.timer_s == 0 { "off".into() } else { format!("{} s", s.timer_s) })),
         ("Auto top-up", if s.rebuy { "on".into() } else { "off".into() }),
+        ("Bots", if m.bots == 0 { "none".into() } else { m.bots.to_string() }),
+        ("Bot skill", m.bot_skill.label().into()),
     ];
     let mut lines = vec![Line::from("")];
     for (i, (label, val)) in rows.into_iter().enumerate() {
@@ -1108,6 +1092,28 @@ mod tests {
             let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
             if w >= 80 {
                 assert!(text.contains("Host a table"), "{w}x{h}: main menu text missing");
+            }
+        }
+    }
+
+    /// The splash's chip loop draws every frame of several laps, at tall and short sizes,
+    /// and chips really do fly (the picture changes over a cycle).
+    #[test]
+    fn splash_chip_loop_runs() {
+        use ratatui::{Terminal, backend::TestBackend};
+        for (w, h) in [(120, 44), (120, 30), (80, 24)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let mut m = menu();
+            m.screen = Screen::Splash;
+            let mut frames = std::collections::HashSet::new();
+            for tick in 0..28 * 12 {
+                m.tick = tick;
+                term.draw(|f| draw(f, &m)).unwrap();
+                let text: String = term.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+                frames.insert(text);
+            }
+            if h >= 40 {
+                assert!(frames.len() > 20, "{w}x{h}: chips don't move ({} distinct frames)", frames.len());
             }
         }
     }

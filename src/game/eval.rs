@@ -33,33 +33,112 @@ impl HandScore {
     }
 
     pub fn describe(&self) -> String {
-        let r = |v: u8| super::cards::RANKS[v as usize];
+        let one = |i: usize| rank_name(self.kickers[i]);
+        let many = |i: usize| rank_plural(self.kickers[i]);
         match self.cat {
             CAT_STRAIGHT_FLUSH => {
                 if self.kickers[0] == 12 {
                     "Royal Flush".into()
                 } else {
-                    format!("Straight Flush, {}-high", r(self.kickers[0]))
+                    format!("Straight Flush, {}-high", one(0))
                 }
             }
-            CAT_QUADS => format!("Four of a Kind, {}s", r(self.kickers[0])),
-            CAT_FULL_HOUSE => format!(
-                "Full House, {}s over {}s",
-                r(self.kickers[0]),
-                r(self.kickers[1])
-            ),
-            CAT_FLUSH => format!("Flush, {}-high", r(self.kickers[0])),
-            CAT_STRAIGHT => format!("Straight, {}-high", r(self.kickers[0])),
-            CAT_TRIPS => format!("Three of a Kind, {}s", r(self.kickers[0])),
-            CAT_TWO_PAIR => format!(
-                "Two Pair, {}s and {}s",
-                r(self.kickers[0]),
-                r(self.kickers[1])
-            ),
-            CAT_PAIR => format!("Pair of {}s", r(self.kickers[0])),
-            _ => format!("High Card {}", r(self.kickers[0])),
+            CAT_QUADS => format!("Four of a Kind, {}", many(0)),
+            CAT_FULL_HOUSE => format!("Full House, {} over {}", many(0), many(1)),
+            CAT_FLUSH => format!("Flush, {}-high", one(0)),
+            CAT_STRAIGHT => format!("Straight, {}-high", one(0)),
+            CAT_TRIPS => format!("Three of a Kind, {}", many(0)),
+            CAT_TWO_PAIR => format!("Two Pair, {} and {}", many(0), many(1)),
+            CAT_PAIR => format!("Pair of {}", many(0)),
+            _ => format!("High Card, {}", one(0)),
         }
     }
+}
+
+pub fn rank_name(v: u8) -> &'static str {
+    ["Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Jack", "Queen", "King", "Ace"][v as usize % 13]
+}
+
+pub fn rank_plural(v: u8) -> &'static str {
+    ["Twos", "Threes", "Fours", "Fives", "Sixes", "Sevens", "Eights", "Nines", "Tens", "Jacks", "Queens", "Kings", "Aces"][v as usize % 13]
+}
+
+/// Best five cards out of five to seven.
+fn best_of(cards: &[Card]) -> HandScore {
+    let n = cards.len();
+    let mut best: Option<HandScore> = None;
+    for mask in 0u32..(1 << n) {
+        if mask.count_ones() != 5 {
+            continue;
+        }
+        let pick: Vec<Card> = (0..n).filter(|i| mask >> i & 1 == 1).map(|i| cards[i]).collect();
+        let score = eval5(&[pick[0], pick[1], pick[2], pick[3], pick[4]]);
+        if best.is_none_or(|b| score > b) {
+            best = Some(score);
+        }
+    }
+    best.expect("at least five cards")
+}
+
+/// Plain-English read of your hand right now, for the player: before the flop the
+/// two cards on their own, after it the best made hand, plus any draw still live.
+pub fn describe_hand(hole: &[Card], board: &[Card]) -> String {
+    let [a, b] = hole else {
+        return String::new();
+    };
+    if board.is_empty() {
+        let (hi, lo) = (a.rank().max(b.rank()), a.rank().min(b.rank()));
+        return if hi == lo {
+            format!("Pocket {}", rank_plural(hi))
+        } else {
+            let kind = if a.suit() == b.suit() { "suited" } else { "offsuit" };
+            format!("{}-{} {kind}", rank_name(hi), rank_name(lo))
+        };
+    }
+    let all: Vec<Card> = hole.iter().chain(board).copied().collect();
+    let score = best_of(&all);
+    let mut text = score.describe();
+
+    // A pair or trips that is entirely on the board isn't really yours.
+    let in_hand = |r: u8| a.rank() == r || b.rank() == r;
+    let on_board_only = match score.cat {
+        CAT_PAIR | CAT_TRIPS => !in_hand(score.kickers[0]),
+        CAT_TWO_PAIR => !in_hand(score.kickers[0]) && !in_hand(score.kickers[1]),
+        _ => false,
+    };
+    if on_board_only {
+        text.push_str(" (on the board)");
+    }
+
+    if board.len() < 5 {
+        let mut notes = Vec::new();
+        if score.cat < CAT_FLUSH {
+            let suited = (0..4u8).any(|s| {
+                all.iter().filter(|c| c.suit() == s).count() == 4 && hole.iter().any(|c| c.suit() == s)
+            });
+            if suited {
+                notes.push("flush draw");
+            }
+        }
+        if score.cat < CAT_STRAIGHT {
+            let mut have = [false; 14]; // index 0 is the ace playing low
+            for c in &all {
+                have[c.rank() as usize + 1] = true;
+                if c.rank() == 12 {
+                    have[0] = true;
+                }
+            }
+            let draw = (0..=9).any(|start| (start..start + 5).filter(|i| have[*i]).count() == 4);
+            if draw {
+                notes.push("straight draw");
+            }
+        }
+        for n in notes {
+            text.push_str(" · ");
+            text.push_str(n);
+        }
+    }
+    text
 }
 
 /// Evaluate exactly five cards.
@@ -252,5 +331,23 @@ mod tests {
     #[test]
     fn royal_beats_king_high_straight_flush() {
         assert!(five("As Ks Qs Js Ts") > five("Ks Qs Js Ts 9s"));
+    }
+
+    #[test]
+    fn describes_a_hand_in_plain_english() {
+        let say = |hole: &str, board: &str| describe_hand(&cards(hole), &cards(board));
+        assert_eq!(say("Ks Kd", ""), "Pocket Kings");
+        assert_eq!(say("As Ks", ""), "Ace-King suited");
+        assert_eq!(say("7c 2d", ""), "Seven-Two offsuit");
+        assert_eq!(say("Ks 9d", "Kd 5c 2h"), "Pair of Kings");
+        assert_eq!(say("Ks 5d", "Kd 5c 2h"), "Two Pair, Kings and Fives");
+        assert_eq!(say("As 3d", "Kd 5c 2h"), "High Card, Ace · straight draw");
+        assert_eq!(say("9s 8s", "2s 5s Kd"), "High Card, King · flush draw");
+        assert_eq!(say("9s 2d", "Kd Kc 5h"), "Pair of Kings (on the board)");
+        assert_eq!(say("9s 8d", "7h 6c 2s Kd Kc"), "Pair of Kings (on the board)");
+        assert_eq!(say("Ah Kh", "Qh Jh 2h"), "Flush, Ace-high");
+        assert_eq!(say("9h 8d", "7s 6c Ah"), "High Card, Ace · straight draw");
+        assert_eq!(say("9h 8d", "7s 6c 5h"), "Straight, Nine-high");
+        assert_eq!(say("5h 4d", "As 3c Kh"), "High Card, Ace · straight draw", "wheel draw");
     }
 }
