@@ -369,3 +369,28 @@ async fn cards_are_mucked_unless_the_player_shows() {
     wait_for(5.0, "alice's cards shown to everyone", || reveal(&b, sa) == 2 && reveal(&a, sa) == 2).await;
     assert_eq!(reveal(&b, sb), 0, "bob still mucked");
 }
+
+/// Bots keep playing after a human crashes mid-hand and rejoins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bots_keep_playing_after_a_rejoin() {
+    let r = room(MemoryBus::new(), 4, 2_000);
+    let host = spawn_host(&r, "host", |c| c.bots = vec![Skill::Easy, Skill::Medium]);
+    host.set_auto(true);
+    let a = spawn_client(&r, "alice", None, |_| {});
+    wait_for(5.0, "table full", || seated(&host) == 4).await;
+    host.send(NetCommand::Start);
+    wait_for(10.0, "alice dealt in", || a.state().cards.is_some()).await;
+    let seat = a.state().seat.unwrap();
+    let hand = a.hand_no();
+    let id = a.id.clone();
+    a.send(NetCommand::Quit);
+    wait_for(2.0, "alice gone", || a.state().closed.is_some()).await;
+
+    let a2 = spawn_client(&r, "alice", Some(id), |_| {});
+    a2.set_auto(true);
+    wait_for(5.0, "alice back", || a2.state().seat == Some(seat)).await;
+    wait_for(40.0, "the hand to finish with bots playing", || {
+        a2.state().view.as_ref().is_some_and(|v| v.hand_no == hand && v.phase == Phase::HandOver)
+    })
+    .await;
+}

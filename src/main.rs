@@ -356,7 +356,8 @@ fn run_tui(session: &Session, mut pending: Option<Launch>, config: store::Config
                     None => return Ok(()),
                 },
             };
-            let seated = !matches!(launch, Launch::Spectate { .. });
+            // Only joins can be rejoined: a table you hosted (and its bots) dies with your process.
+            let seated = matches!(launch, Launch::Join { .. });
             let (app, rx) = match session.start(launch) {
                 Ok(started) => started,
                 Err(e) => {

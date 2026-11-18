@@ -24,8 +24,36 @@ pub fn draw_lobby(f: &mut Frame, area: Rect, app: &App, view: &TableView) {
     } else {
         "waiting for host"
     };
+    // Room card: code, who's here (one per line so nobody is cut off), what happens next.
+    let glow = anim::pulse(app.tick);
+    let code_bg = Color::Rgb(200 + (55.0 * glow) as u8, 165 + (40.0 * glow) as u8, 70);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(format!("  {}  ", app.code), Style::default().fg(Color::Black).bg(code_bg).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+    ];
+    for s in &seated {
+        let me = app.my_seat == Some(s.seat);
+        lines.push(Line::from(Span::styled(
+            s.name.clone(),
+            Style::default().fg(if me { YOU } else { TEXT }).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        deal_hint,
+        if app.mode == Mode::Host && seated.len() >= 2 {
+            Style::default().fg(Color::Rgb((150.0 + 105.0 * glow) as u8, 255, (150.0 + 105.0 * glow) as u8)).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        },
+    )));
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let w = 56.min(area.width);
+
     // A royal flush fanned across the top, as big as fits above the room card.
-    let sz = [BIG, SMALL].into_iter().find(|sz| area.height >= sz.h + 13 && area.width >= 5 * (sz.w + 2));
+    let sz = [BIG, SMALL].into_iter().find(|sz| area.height >= sz.h + 2 + h + 2 && area.width >= 5 * (sz.w + 2));
     let art_fits = app.show_art && sz.is_some();
     if let (true, Some(sz)) = (art_fits, sz) {
         let step = sz.w + 2;
@@ -37,43 +65,6 @@ pub fn draw_lobby(f: &mut Frame, area: Rect, app: &App, view: &TableView) {
             }
         }
     }
-
-    // Room card: code, rules, who's here.
-    let names: Vec<Span> = seated
-        .iter()
-        .enumerate()
-        .flat_map(|(i, s)| {
-            let me = app.my_seat == Some(s.seat);
-            let mut v = vec![Span::styled(
-                s.name.clone(),
-                Style::default().fg(if me { YOU } else { TEXT }).add_modifier(Modifier::BOLD),
-            )];
-            if i + 1 < seated.len() {
-                v.push(Span::styled("  ·  ", Style::default().fg(DIM)));
-            }
-            v
-        })
-        .collect();
-    let glow = anim::pulse(app.tick);
-    let code_bg = Color::Rgb(200 + (55.0 * glow) as u8, 165 + (40.0 * glow) as u8, 70);
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(format!("  {}  ", app.code), Style::default().fg(Color::Black).bg(code_bg).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(""),
-        Line::from(names),
-        Line::from(""),
-        Line::from(Span::styled(
-            deal_hint,
-            if app.mode == Mode::Host && seated.len() >= 2 {
-                Style::default().fg(Color::Rgb((150.0 + 105.0 * glow) as u8, 255, (150.0 + 105.0 * glow) as u8)).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(DIM)
-            },
-        )),
-    ];
-    let h = lines.len() as u16 + 2;
-    let w = 56.min(area.width);
     let rect = if art_fits {
         Rect::new(area.x + area.width.saturating_sub(w) / 2, area.y + area.height.saturating_sub(h + 1), w, h)
     } else {

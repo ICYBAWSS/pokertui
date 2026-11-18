@@ -1,7 +1,7 @@
 //! Ratatui rendering: felt table, boxed seats, real-looking cards, the action
 //! panel (your hand + big buttons) and the log.
 
-use crate::app::App;
+use crate::app::{App, Mode};
 use crate::game::Phase;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -74,7 +74,10 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_body(f: &mut Frame, area: Rect, app: &App) {
-    let Some(view) = &app.view else {
+    // A client shows nothing from the table until the host has accepted it: before that, any
+    // view is a stale retained snapshot of a host that may be long gone.
+    let waiting_for_host = app.mode == Mode::Client && app.my_seat.is_none();
+    let Some(view) = app.view.as_ref().filter(|_| !waiting_for_host) else {
         const SPIN: [&str; 4] = ["♠", "♥", "♦", "♣"];
         let spin = SPIN[(app.tick / 3 % 4) as usize];
         let dots = ".".repeat((app.tick / 6 % 4) as usize);
