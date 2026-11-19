@@ -10,6 +10,8 @@ pub enum Skill {
     Easy,
     Medium,
     Hard,
+    /// Game-theory-optimal style: balanced ranges, mixed strategies.
+    Gto,
 }
 
 impl Skill {
@@ -18,6 +20,7 @@ impl Skill {
             Skill::Easy => "Easy",
             Skill::Medium => "Medium",
             Skill::Hard => "Hard",
+            Skill::Gto => "GTO",
         }
     }
 
@@ -25,7 +28,8 @@ impl Skill {
         match self {
             Skill::Easy => Skill::Medium,
             Skill::Medium => Skill::Hard,
-            Skill::Hard => Skill::Easy,
+            Skill::Hard => Skill::Gto,
+            Skill::Gto => Skill::Easy,
         }
     }
 
@@ -34,6 +38,7 @@ impl Skill {
             "easy" | "e" => Some(Skill::Easy),
             "medium" | "med" | "m" => Some(Skill::Medium),
             "hard" | "h" => Some(Skill::Hard),
+            "gto" | "g" => Some(Skill::Gto),
             _ => None,
         }
     }
@@ -136,8 +141,19 @@ fn chen(hole: [Card; 2]) -> f64 {
 
 /// Chen score needed to be in the top `frac` of all starting hands.
 fn range_cutoff(frac: f64) -> f64 {
+    let all = sorted_chen();
+    all[((1.0 - frac.clamp(0.0, 1.0)) * (all.len() - 1) as f64) as usize]
+}
+
+/// Share of all starting hands this one beats or ties (1.0 = best).
+fn percentile(hole: [Card; 2]) -> f64 {
+    let all = sorted_chen();
+    all.partition_point(|&x| x <= chen(hole)) as f64 / all.len() as f64
+}
+
+fn sorted_chen() -> &'static [f64] {
     static SORTED: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
-    let all = SORTED.get_or_init(|| {
+    SORTED.get_or_init(|| {
         let deck = full_deck();
         let mut v = Vec::with_capacity(1326);
         for i in 0..deck.len() {
@@ -147,8 +163,7 @@ fn range_cutoff(frac: f64) -> f64 {
         }
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v
-    });
-    all[((1.0 - frac.clamp(0.0, 1.0)) * (all.len() - 1) as f64) as usize]
+    })
 }
 
 /// Share of the pot we win against `opponents` random hands, by simulation.
@@ -243,6 +258,7 @@ pub fn decide(skill: Skill, v: &BotView, rng: &mut ChaCha20Rng) -> Move {
             }
         }
         Skill::Medium | Skill::Hard => model(skill, v, rng, r),
+        Skill::Gto => gto(v, rng, r),
     }
 }
 
@@ -284,6 +300,86 @@ fn model(skill: Skill, v: &BotView, rng: &mut ChaCha20Rng, r: f64) -> Move {
         Move::Call
     } else if v.legal.can_raise && r < bluff * 0.5 && v.to_call * 6 < v.stack {
         raise(v, SIZE)
+    } else {
+        Move::Fold
+    }
+}
+
+/// Game-theory-optimal style. Not a solved strategy (heads-up hold'em alone is
+/// far too big to solve here) but the same principles a solver converges to:
+/// position-based preflop ranges, defending at least the minimum defence
+/// frequency, and bluffing at the ratio that makes calls indifferent. Every
+/// close spot is mixed randomly so there is no pattern to exploit.
+fn gto(v: &BotView, rng: &mut ChaCha20Rng, r: f64) -> Move {
+    let pos = if v.late { 1.0 } else { 0.0 };
+    let facing_raise = v.opp_actions.iter().any(|&(_, raises)| raises > 0);
+    let pot_before = v.pot.saturating_sub(v.to_call).max(1) as f64;
+    // Fraction of the pot we must defend to stop a pure bluff from profiting.
+    let mdf = pot_before / v.pot.max(1) as f64;
+    let needed = v.to_call as f64 / (v.pot + v.to_call).max(1) as f64;
+    let cheap = (v.to_call as f64) * 6.0 < v.stack as f64;
+
+    if v.board.is_empty() {
+        let p = percentile(v.hole);
+        // Wider with the button and when fewer players are left to act behind.
+        let table = 1.0 / (1.0 + 0.12 * v.opponents.saturating_sub(1) as f64);
+        if !facing_raise {
+            let open = (0.28 + 0.2 * pos) * table;
+            return if p >= 1.0 - open {
+                raise(v, 2.0)
+            } else if v.to_call == 0 {
+                Move::Check
+            } else if p >= 1.0 - open - 0.25 && cheap && v.to_call * 3 <= v.pot {
+                Move::Call
+            } else {
+                Move::Fold
+            };
+        }
+        // Polarised 3-bet: premiums for value plus a few suited/connected bluffs.
+        let value = 0.06 * table;
+        if p >= 1.0 - value || (p > 0.6 && p < 0.78 && r < 0.07 && cheap) {
+            return raise(v, 1.0);
+        }
+        let keep = (mdf * 0.55 * table).clamp(0.05, 0.5);
+        return if p >= 1.0 - keep { Move::Call } else { Move::Fold };
+    }
+
+    let fracs: Vec<f64> = (0..v.opponents)
+        .map(|o| {
+            let (c, rr) = v.opp_actions.get(o).copied().unwrap_or((0, 0));
+            (0.65f64.powi(c as i32) * 0.3f64.powi(rr as i32)).max(0.05)
+        })
+        .collect();
+    let e = equity_vs(v, 700, rng, &fracs);
+    let fair = 1.0 / (v.opponents as f64 + 1.0);
+    let river = v.street == Street::River;
+
+    if v.to_call == 0 {
+        return if e > fair + 0.38 {
+            if r < 0.8 { raise(v, 1.0) } else { Move::Check }
+        } else if e > fair + 0.22 {
+            if r < 0.85 { raise(v, 0.75) } else { Move::Check }
+        } else if e > fair + 0.08 {
+            if r < 0.55 { raise(v, 0.33) } else { Move::Check }
+        } else if river && e < fair - 0.15 && r < 0.22 {
+            // Pure bluff with the worst hands: bet/(pot+2*bet) of the range at 2/3 pot.
+            raise(v, 0.66)
+        } else if !river && e < fair && e > fair - 0.25 && r < 0.2 + 0.05 * pos {
+            // Semi-bluff with hands that can still improve.
+            raise(v, 0.66)
+        } else {
+            Move::Check
+        };
+    }
+    if e > fair + 0.3 {
+        if r < 0.6 { raise(v, 0.75) } else { Move::Call }
+    } else if e > needed + 0.02 {
+        Move::Call
+    } else if e > needed * 0.7 && r < mdf * 0.5 {
+        // Bluff-catch some marginal hands so a bluff cannot print money.
+        Move::Call
+    } else if !river && e > needed * 0.5 && v.legal.can_raise && cheap && r < 0.07 {
+        raise(v, 0.75)
     } else {
         Move::Fold
     }
@@ -357,7 +453,7 @@ mod tests {
             turn_ms: 0,
             tourney: None,
         });
-        for (i, skill) in [Skill::Easy, Skill::Medium, Skill::Hard, Skill::Easy].into_iter().enumerate() {
+        for (i, skill) in [Skill::Gto, Skill::Medium, Skill::Hard, Skill::Easy].into_iter().enumerate() {
             t.join_bot(NAMES[i], skill).unwrap();
         }
         let total = t.total_chips();
@@ -437,5 +533,50 @@ mod tests {
             }
         }
         assert!(profit["Hard"] > profit["Easy"] / 2 && profit["Hard"] > 0, "{profit:?}");
+    }
+
+    #[test]
+    fn gto_folds_trash_to_a_raise_and_opens_aces() {
+        let mut rng = ChaCha20Rng::from_seed([4; 32]);
+        let mut folds = 0;
+        for _ in 0..100 {
+            let mut trash = view("7c 2d", "", 300, 800, 1);
+            trash.opp_actions = vec![(0, 1)];
+            folds += (decide(Skill::Gto, &trash, &mut rng) == Move::Fold) as u32;
+            let aces = view("As Ah", "", 30, 0, 1);
+            assert!(matches!(decide(Skill::Gto, &aces, &mut rng), Move::Raise { .. } | Move::AllIn));
+        }
+        assert!(folds >= 85, "folded trash only {folds}/100 times");
+    }
+
+    #[test]
+    fn gto_beats_easy() {
+        let mut rng = ChaCha20Rng::from_seed([12; 32]);
+        let mut t = Table::new(TableParams {
+            max_seats: 3,
+            small_blind: 10,
+            big_blind: 20,
+            buyin: 1_000,
+            turn_ms: 0,
+            tourney: None,
+        });
+        for (i, skill) in [Skill::Gto, Skill::Easy, Skill::Easy].into_iter().enumerate() {
+            t.join_bot(NAMES[i], skill).unwrap();
+        }
+        let mut gto = 0i64;
+        for hand in 0..200 {
+            for (_, s) in t.players_mut() {
+                s.stack = 1_000;
+            }
+            t.start_hand(hand).unwrap();
+            while t.phase == Phase::Betting {
+                let seat = t.actor.unwrap();
+                let skill = t.seats[seat].as_ref().unwrap().bot.unwrap();
+                let v = t.bot_view(seat).unwrap();
+                t.apply(seat, decide(skill, &v, &mut rng), 0).unwrap();
+            }
+            gto += t.seats[0].as_ref().unwrap().stack as i64 - 1_000;
+        }
+        assert!(gto > 0, "GTO bot lost {gto} to two Easy bots");
     }
 }

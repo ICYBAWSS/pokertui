@@ -585,6 +585,7 @@ impl App {
                 KeyCode::Char('e' | 'E' | '1') => Some(Skill::Easy),
                 KeyCode::Char('m' | 'M' | '2') => Some(Skill::Medium),
                 KeyCode::Char('h' | 'H' | '3') => Some(Skill::Hard),
+                KeyCode::Char('g' | 'G' | '4') => Some(Skill::Gto),
                 _ => None,
             };
             if let Some(skill) = skill {

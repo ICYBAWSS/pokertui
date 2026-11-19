@@ -123,7 +123,7 @@ fn main() -> Result<()> {
             }
             let bots = bots
                 .iter()
-                .map(|b| Skill::parse(b).with_context(|| format!("unknown bot skill `{b}` (easy, medium, hard)")))
+                .map(|b| Skill::parse(b).with_context(|| format!("unknown bot skill `{b}` (easy, medium, hard, gto)")))
                 .collect::<Result<Vec<_>>>()?;
             if bots.len() + 1 > seats {
                 bail!("--bots needs free seats: {} bots + you do not fit in {seats}", bots.len());

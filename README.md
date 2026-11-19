@@ -138,7 +138,7 @@ alice (host)                                  bob (client)
 
 ## Extras
 
-- **Bots:** press `+` as host, or `poker host --bots easy,medium,hard`.
+- **Bots:** press `+` as host, or `poker host --bots easy,medium,hard,gto` (GTO plays balanced, mixed-strategy poker).
 - **Sit & Go tournaments:** pick it in the host menu. Blinds rise on a timer, last player wins.
 - **Approve joiners:** `poker host --approve` makes new players wait until you press `y` (accept) or `n` (decline). Players returning to their own seat skip it.
 - **Kick / ban:** as host press `k` (remove) or `K` (ban), then the seat number.

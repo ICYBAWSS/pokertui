@@ -17,7 +17,8 @@ pub fn draw_bot_pick(f: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::raw(" [e]"), Span::styled(" Easy", Style::default().fg(TEXT)), Span::raw("   [m]"),
             Span::styled(" Medium", Style::default().fg(TEXT)), Span::raw("   [h]"),
-            Span::styled(" Hard", Style::default().fg(TEXT)), Span::styled("      Esc cancel", Style::default().fg(DIM)),
+            Span::styled(" Hard", Style::default().fg(TEXT)), Span::raw("   [g]"),
+            Span::styled(" GTO", Style::default().fg(TEXT)), Span::styled("     Esc cancel", Style::default().fg(DIM)),
         ]),
         Line::from(""),
     ];
