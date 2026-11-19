@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 mod card;
+pub mod chips;
 mod panel;
 mod table;
 mod overlay;
@@ -38,20 +39,25 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     let panel = panel_h(area.height);
     // The log gets its own bordered box when there's room, a bare line otherwise.
-    let spare = area.height.saturating_sub(1 + panel + 14);
+    let spare = area.height.saturating_sub(1 + panel + 16);
     let log_h = if spare >= 4 { spare.min(8) } else { 1 };
+    // Short terminals: the one-line log shares the footer row, so the table keeps room for the
+    // pot line above the board.
+    let merged = log_h == 1;
     let chunks = Layout::vertical([
-        Constraint::Min(14),
+        Constraint::Min(15),
         Constraint::Length(panel),
-        Constraint::Length(log_h),
+        Constraint::Length(if merged { 0 } else { log_h }),
         Constraint::Length(1),
     ])
     .split(area);
 
     draw_body(f, chunks[0], app);
     panel::draw_panel(f, chunks[1], app);
-    panel::draw_log(f, chunks[2], app);
-    panel::draw_footer(f, chunks[3], app);
+    if !merged {
+        panel::draw_log(f, chunks[2], app);
+    }
+    panel::draw_footer(f, chunks[3], app, merged);
 
     if app.raise.is_some() {
         overlay::draw_raise(f, area, app);

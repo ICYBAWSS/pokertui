@@ -45,6 +45,22 @@ pub struct RaisePicker {
     pub typed: Option<String>,
 }
 
+/// Where a flying chip starts or ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spot {
+    Seat(usize),
+    Pot,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Flight {
+    pub from: Spot,
+    pub to: Spot,
+    pub at: Instant,
+    pub delay_ms: u64,
+    pub color: ratatui::style::Color,
+}
+
 /// Timestamps that drive the table animations; see `ui`.
 #[derive(Clone, Debug, Default)]
 pub struct Anim {
@@ -53,8 +69,11 @@ pub struct Anim {
     pub board_at: Option<Instant>,
     pub pot_from: u64,
     pub pot_at: Option<Instant>,
-    pub chips_from: Vec<usize>,
-    pub chips_at: Option<Instant>,
+    /// Chips in the air: bets flying to the pot, and the pot flying to the winners.
+    pub flights: Vec<Flight>,
+    /// What each winner collected, and when the payout started (their racks catch up as chips land).
+    pub payout: Vec<(usize, u64)>,
+    pub payout_at: Option<Instant>,
     pub deadline: u64,
     pub deadline_total: u64,
     pub result_at: Option<Instant>,
@@ -64,7 +83,10 @@ pub const DEAL_MS: u64 = 550;
 pub const FLIP_MS: u64 = 260;
 pub const FLIP_STAGGER_MS: u64 = 140;
 pub const POT_MS: u64 = 500;
-pub const CHIPS_MS: u64 = 420;
+/// One chip's trip, and the stagger between chips.
+pub const FLIGHT_MS: u64 = 650;
+pub const FLIGHT_STAGGER_MS: u64 = 90;
+pub const PAYOUT_MS: u64 = FLIGHT_MS + 6 * FLIGHT_STAGGER_MS;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -305,16 +327,25 @@ impl App {
             a.pot_from = if new_hand { 0 } else { shown_pot };
             a.pot_at = Some(now);
         }
-        if !new_hand && new.pot > old.pot {
-            let swept: Vec<usize> = old
-                .seats
-                .iter()
-                .filter(|s| s.bet > 0 && new.seats.get(s.seat).is_some_and(|n| n.bet == 0))
-                .map(|s| s.seat)
-                .collect();
-            if !swept.is_empty() {
-                a.chips_from = swept;
-                a.chips_at = Some(now);
+        // Every bet (and blind) sends chips from the player to the pot.
+        for n in &new.seats {
+            let before = if new_hand { 0 } else { old.seats.get(n.seat).map_or(0, |s| s.bet) };
+            if n.bet > before {
+                for (k, color) in crate::ui::chips::flight_colors(n.bet - before, (new.small_blind, new.big_blind), 4).into_iter().enumerate() {
+                    a.flights.push(Flight { from: Spot::Seat(n.seat), to: Spot::Pot, at: now, delay_ms: k as u64 * FLIGHT_STAGGER_MS, color });
+                }
+            }
+        }
+        if new.phase == Phase::HandOver
+            && old.phase != Phase::HandOver
+            && let Some(result) = &new.last_result
+        {
+            a.payout = result.collected();
+            a.payout_at = Some(now);
+            for (seat, amount) in &a.payout {
+                for (k, color) in crate::ui::chips::flight_colors(*amount, (new.small_blind, new.big_blind), 6).into_iter().enumerate() {
+                    a.flights.push(Flight { from: Spot::Pot, to: Spot::Seat(*seat), at: now, delay_ms: k as u64 * FLIGHT_STAGGER_MS, color });
+                }
             }
         }
         if new.deadline_ms != a.deadline {
@@ -434,6 +465,7 @@ impl App {
         {
             self.celebrate_until = None;
         }
+        self.anim.flights.retain(|f| (f.at.elapsed().as_millis() as u64) < f.delay_ms + FLIGHT_MS);
     }
 
     /// Submit a command line from plain mode.

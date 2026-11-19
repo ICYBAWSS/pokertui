@@ -1,10 +1,11 @@
 //! The table: lobby, felt, board, seats and the deal / chip / firework animations.
 
 use super::card::{BIG, CardView, Face, SMALL, rank_str};
+use super::chips;
 use super::theme::*;
 use super::{popup, truncate};
 use crate::anim;
-use crate::app::{self, App, Mode};
+use crate::app::{self, App, Mode, Spot};
 use crate::game::{Card, Phase, Street, TableView};
 use crate::menu::chips;
 use ratatui::Frame;
@@ -13,9 +14,7 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
-use std::time::Duration;
 
-const SEAT_H: u16 = 3;
 
 pub fn draw_lobby(f: &mut Frame, area: Rect, app: &App, view: &TableView) {
     let seated: Vec<&crate::game::SeatView> = view.seats.iter().filter(|s| !s.name.is_empty()).collect();
@@ -77,20 +76,25 @@ pub fn draw_lobby(f: &mut Frame, area: Rect, app: &App, view: &TableView) {
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Center).block(block), rect);
 }
 
-/// "★ bob wins 1,200 · Two Pair ★", or "★ YOU WIN …" when it's you.
+/// "* bob wins 1,200 · Two Pair *", or "*** YOU WIN … ***" when it's you. Amounts are what each
+/// winner actually collected, so split and side pots add up.
 fn winner_banner(app: &App, view: &TableView) -> Option<(String, bool)> {
     if view.phase != Phase::HandOver {
         return None;
     }
-    let p = view.last_result.as_ref()?.pots.first()?;
-    let me = app.my_seat.is_some_and(|m| p.winners.contains(&m));
+    let result = view.last_result.as_ref()?;
+    let p = result.pots.first()?;
+    let won = result.collected();
+    let mine = app.my_seat.and_then(|me| won.iter().find(|(s, _)| *s == me)).map(|(_, a)| *a);
     // "alice wins uncontested" would just repeat the name.
     let desc = if p.desc.is_empty() || p.desc.ends_with("uncontested") { String::new() } else { format!(" · {}", p.desc) };
-    Some(if me {
-        (format!(" *** YOU WIN {}{desc} *** ", chips(p.amount)), true)
+    Some(if let Some(amount) = mine {
+        (format!(" *** YOU WIN {}{desc} *** ", chips(amount)), true)
+    } else if won.len() == 1 {
+        (format!("* {} wins {}{desc} *", app.seat_name(won[0].0), chips(won[0].1)), false)
     } else {
-        let names = p.winners.iter().map(|w| app.seat_name(*w)).collect::<Vec<_>>().join(" & ");
-        (format!("* {names} wins {}{desc} *", chips(p.amount)), false)
+        let list = won.iter().map(|(s, a)| format!("{} {}", app.seat_name(*s), chips(*a))).collect::<Vec<_>>().join(" & ");
+        (format!("* {list}{desc} *"), false)
     })
 }
 
@@ -118,13 +122,20 @@ pub fn draw_table(f: &mut Frame, area: Rect, app: &App, view: &TableView) {
     f.render_widget(block, area);
 
     // Board in the middle, pot line just above it, seats around.
-    let sz = if inner.height >= 2 * SEAT_H + BIG.h + 2 && inner.width >= 5 * BIG.w + 4 + 2 * 20 { BIG } else { SMALL };
+    // Seats grow a row for their chips when the table is tall enough.
+    let seat_h: u16 = if inner.height >= 2 * 4 + SMALL.h + 1 { 4 } else { 3 };
+    let sz = if inner.height >= 2 * seat_h + BIG.h + 2 && inner.width >= 5 * BIG.w + 4 + 2 * 20 { BIG } else { SMALL };
     let board_w = sz.w * 5 + 4;
     let board_x = inner.x + inner.width.saturating_sub(board_w) / 2;
     // Pot sits on the line above the board; on a short table there's no such
     // line, so it goes on the table's bottom border instead.
-    let roomy = inner.height > 2 * SEAT_H + sz.h;
-    let board_y = if roomy { (inner.y + inner.height.saturating_sub(sz.h) / 2).max(inner.y + SEAT_H + 1) } else { inner.y + SEAT_H };
+    let roomy = inner.height > 2 * seat_h + sz.h;
+    let two_rows = inner.height >= 2 * seat_h + sz.h + 2;
+    let board_y = if two_rows {
+        (inner.y + inner.height.saturating_sub(sz.h) / 2).max(inner.y + seat_h + 2)
+    } else if roomy { (inner.y + inner.height.saturating_sub(sz.h) / 2).max(inner.y + seat_h + 1) } else { inner.y + seat_h };
+    // With a spare row the pot's chips sit centred on top of its label; otherwise they go to the
+    // right of the label.
     let pot_y = if roomy { board_y - 1 } else { inner.y + inner.height };
     let center = (inner.x + inner.width / 2, pot_y);
 
@@ -134,6 +145,22 @@ pub fn draw_table(f: &mut Frame, area: Rect, app: &App, view: &TableView) {
         None => (format!("POT  {}", chips(app.pot_shown() + view.seats.iter().map(|s| s.bet).sum::<u64>())), Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
     };
     let pot_x = inner.x + inner.width.saturating_sub(pot_text.chars().count() as u16) / 2;
+    // The pot as chips either side of its label (while it pays out, the amount being paid).
+    let blinds = (view.small_blind, view.big_blind);
+    let paying_total: u64 = app.anim.payout.iter().map(|(_, a)| *a).sum();
+    let pot_chips = if app.anim.payout_at.is_some_and(|at| at.elapsed().as_millis() < app::PAYOUT_MS as u128) {
+        paying_total
+    } else {
+        app.pot_shown() + view.seats.iter().map(|s| s.bet).sum::<u64>()
+    };
+    let run = chips::chip_run(pot_chips, blinds, if two_rows { (inner.width as usize / 2).min(30) } else { 14 });
+    let text_w = pot_text.chars().count() as u16;
+    let (chips_y, chips_x) = if two_rows {
+        (pot_y - 1, inner.x + inner.width.saturating_sub(run.len() as u16) / 2)
+    } else {
+        (pot_y, pot_x + text_w + 1)
+    };
+    let pot_cells: Vec<(u16, Color)> = run.iter().enumerate().filter_map(|(i, c)| c.map(|c| (chips_x + i as u16, c))).collect();
 
     for i in 0usize..5 {
         let x = board_x + i as u16 * (sz.w + 1);
@@ -177,7 +204,7 @@ pub fn draw_table(f: &mut Frame, area: Rect, app: &App, view: &TableView) {
     for (i, seat) in occupied.iter().enumerate() {
         let rel = (i + n - anchor) % n;
         let (fx, fy) = positions[rel.min(positions.len() - 1)];
-        rects.push((*seat, at(inner, fx, fy, panel_w, SEAT_H)));
+        rects.push((*seat, at(inner, fx, fy, panel_w, seat_h)));
     }
     rects.sort_by_key(|(seat, _)| (*seat + n - occupied[anchor]) % view.seats.len().max(1));
 
@@ -196,10 +223,19 @@ pub fn draw_table(f: &mut Frame, area: Rect, app: &App, view: &TableView) {
         (0..2).filter(|round| ms >= (round * dealt.len() + k) as u64 * step + step).count()
     };
 
+    // While the pot is paying out, a winner's chips only appear as the flying ones land.
+    let paying = app.anim.payout_at.is_some_and(|at| at.elapsed().as_millis() < app::PAYOUT_MS as u128);
     for (seat, rect) in &rects {
-        f.render_widget(SeatWidget { app, view, seat: *seat, cards_landed: landed(*seat) }, *rect);
+        let owed = if paying { app.anim.payout.iter().find(|(w, _)| w == seat).map_or(0, |(_, a)| *a) } else { 0 };
+        let chip_stack = view.seats.get(*seat).map_or(0, |s| s.stack).saturating_sub(owed);
+        f.render_widget(SeatWidget { chip_stack, app, view, seat: *seat, cards_landed: landed(*seat) }, *rect);
     }
     f.buffer_mut().set_string(pot_x, pot_y, &pot_text, pot_style);
+    if pot_y < inner.y + inner.height {
+        for (x, c) in &pot_cells {
+            f.buffer_mut().set_string(*x, chips_y, "●", Style::default().fg(*c).bg(FELT_DARK));
+        }
+    }
 
     if let Some(ms) = deal_ms.filter(|ms| *ms < app::DEAL_MS + step) {
         for c in 0..total_cards {
@@ -217,22 +253,27 @@ pub fn draw_table(f: &mut Frame, area: Rect, app: &App, view: &TableView) {
         }
     }
 
-    // Chips sweep into the pot when a betting round ends.
-    if let Some(at) = app.anim.chips_at {
-        let t = anim::progress(at, Duration::from_millis(app::CHIPS_MS));
-        if t < 1.0 {
-            for seat in &app.anim.chips_from {
-                if let Some((_, r)) = rects.iter().find(|(s, _)| s == seat) {
-                    for trail in 0..3 {
-                        let tt = anim::ease_out((t - trail as f32 * 0.08).max(0.0));
-                        let x = anim::lerp(r.x + r.width / 2, center.0, tt);
-                        let y = anim::lerp(r.y + 1, center.1, tt);
-                        let glyph = ["$", "o", "."][trail];
-                        f.buffer_mut().set_string(x, y, glyph, Style::default().fg(GOLD).bg(FELT_DARK));
-                    }
-                }
-            }
+    // Chips in flight: bets into the pot, the pot out to the winners. Seats' chips sit at the right
+    // end of their box, so that is where chips leave from and land.
+    let spot = |s: Spot| -> (i32, i32) {
+        match s {
+            Spot::Pot => (center.0 as i32 - 1, center.1 as i32),
+            Spot::Seat(seat) => rects
+                .iter()
+                .find(|(r, _)| *r == seat)
+                .map_or((center.0 as i32, center.1 as i32), |(_, r)| ((r.x + r.width) as i32 - 5, (r.y + 1) as i32)),
         }
+    };
+    for fl in &app.anim.flights {
+        let ms = fl.at.elapsed().as_millis() as i64 - fl.delay_ms as i64;
+        if ms < 0 || ms >= app::FLIGHT_MS as i64 {
+            continue;
+        }
+        let t = anim::ease_out(ms as f32 / app::FLIGHT_MS as f32);
+        let ((x0, y0), (x1, y1)) = (spot(fl.from), spot(fl.to));
+        let x = x0 as f32 + (x1 - x0) as f32 * t;
+        let y = y0 as f32 + (y1 - y0) as f32 * t - (std::f32::consts::PI * t).sin() * 2.0;
+        chips::draw_chip(f.buffer_mut(), x.round() as i32, y.round() as i32, fl.color, FELT_DARK);
     }
 
     // Fireworks when you win a pot.
@@ -281,6 +322,8 @@ fn ordinal(n: usize) -> String {
 
 /// One player's box: name, badges, stack, bet, status and their cards.
 struct SeatWidget<'a> {
+    /// Chips to draw in the box: the stack, less what a winner is still waiting to receive.
+    chip_stack: u64,
     app: &'a App,
     view: &'a TableView,
     seat: usize,
@@ -289,7 +332,7 @@ struct SeatWidget<'a> {
 
 impl Widget for SeatWidget<'_> {
     fn render(self, rect: Rect, buf: &mut Buffer) {
-        let SeatWidget { app, view, seat, cards_landed } = self;
+        let SeatWidget { chip_stack, app, view, seat, cards_landed } = self;
     let s = &view.seats[seat];
     let is_actor = view.actor == Some(seat) && view.phase == Phase::Betting;
     let is_me = app.my_seat == Some(seat);
@@ -393,26 +436,21 @@ impl Widget for SeatWidget<'_> {
     let used = line.width() as u16;
     buf.set_line(rect.x + 2, rect.y + 1, &line, rect.width.saturating_sub(3));
 
-    // A few small chips on the right: how much you have, next to the biggest stack at the table.
-    let biggest = view.seats.iter().map(|x| x.stack).max().unwrap_or(0).max(1);
-    let n = if s.stack == 0 { 0 } else { (s.stack as f64 / biggest as f64 * 6.0).ceil().clamp(1.0, 6.0) as u16 };
-    let tint = if out {
-        DIM
+    // The player's chips: runs of each denomination. On a tall table they get their own row in
+    // the box; on a short one they share the stack's line.
+    let bg = if is_actor { Color::Rgb(28, 62, 42) } else { FELT_DARK };
+    let (row, x0, room) = if rect.height >= 4 {
+        (rect.y + 2, rect.x + 2, rect.width.saturating_sub(4))
     } else {
-        match s.stack / view.big_blind.max(1) {
-            0..=19 => Color::Rgb(135, 135, 145),
-            20..=49 => Color::Rgb(75, 120, 185),
-            50..=99 => Color::Rgb(70, 150, 95),
-            100..=199 => Color::Rgb(175, 80, 80),
-            _ => Color::Rgb(185, 155, 70),
-        }
+        let room = rect.width.saturating_sub(2 + used + 2 + 2);
+        (rect.y + 1, rect.x + rect.width - 3 - room, room)
     };
-    let start = (rect.x + rect.width).saturating_sub(2 + n);
-    if n > 0 && start > rect.x + 2 + used + 1 {
-        buf.set_string(start, rect.y + 1, "●".repeat(n as usize), Style::default().fg(tint));
+    for (i, chip) in chips::chip_run(chip_stack, (view.small_blind, view.big_blind), room as usize).into_iter().enumerate() {
+        if let Some(c) = chip {
+            buf.set_string(x0 + i as u16, row, "●", Style::default().fg(c).bg(bg));
+        }
     }
-}
-
+    }
 }
 
 fn seat_positions(n: usize) -> &'static [(u16, u16)] {

@@ -312,6 +312,25 @@ pub struct SeatReveal {
     pub won: u64,
 }
 
+impl HandResult {
+    /// What each winning seat actually collected across every pot: split pots are divided
+    /// (odd chips go to the first winners, who are listed in button order), side pots add up.
+    pub fn collected(&self) -> Vec<(SeatId, u64)> {
+        let mut out: Vec<(SeatId, u64)> = Vec::new();
+        for pot in &self.pots {
+            let n = pot.winners.len().max(1) as u64;
+            for (i, w) in pot.winners.iter().enumerate() {
+                let take = pot.amount / n + u64::from((i as u64) < pot.amount % n);
+                match out.iter_mut().find(|(s, _)| s == w) {
+                    Some((_, t)) => *t += take,
+                    None => out.push((*w, take)),
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PotAward {
     pub amount: u64,
@@ -1075,7 +1094,7 @@ impl Table {
         for (_, s) in self.players_mut() {
             s.bet = 0;
             s.contributed = 0;
-            s.shown = s.bot.is_some() && !s.folded && !s.hole.is_empty();
+            s.shown = s.bot.is_some() && !s.hole.is_empty(); // bots always show
         }
         self.last_result = Some(result);
         self.phase = Phase::HandOver;
@@ -1212,6 +1231,7 @@ impl Table {
         for (_, s) in self.players_mut() {
             s.bet = 0;
             s.contributed = 0;
+            s.shown = s.bot.is_some() && !s.hole.is_empty(); // bots always show
         }
         self.last_result = Some(result);
         self.phase = Phase::HandOver;
@@ -1592,6 +1612,26 @@ pub fn verify_record(record: &HandRecord) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn collected_splits_pots_and_adds_side_pots() {
+        let pot = |amount, winners: &[usize]| PotAward { amount, winners: winners.to_vec(), desc: String::new() };
+        let result = HandResult {
+            hand_no: 1,
+            board: vec![],
+            reveals: vec![],
+            pots: vec![pot(101, &[2, 0]), pot(40, &[0])],
+            deck_nonce: String::new(),
+            deck: vec![],
+            commit: String::new(),
+            seed: None,
+            moves: vec![],
+            button: 0,
+            stacks: vec![],
+        };
+        // Seat 2 is first in button order so takes the odd chip; seat 0 also wins the side pot.
+        assert_eq!(result.collected(), vec![(2, 51), (0, 90)]);
+    }
+
     #[test]
     fn button_and_blinds_rotate_each_hand() {
         let mut t = Table::new(TableParams {

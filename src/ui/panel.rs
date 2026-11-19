@@ -6,7 +6,7 @@ use crate::app::{self, App, LogKind, LogLine, Mode};
 use crate::game::{Card, Phase, describe_hand};
 use crate::menu::chips;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{LineGauge, Paragraph};
@@ -202,7 +202,7 @@ pub fn draw_log(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-pub fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+pub fn draw_footer(f: &mut Frame, area: Rect, app: &App, with_log: bool) {
     let mut spans = vec![];
     if !app.connected {
         spans.push(badge("offline", RED));
@@ -215,6 +215,20 @@ pub fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         " [?] help"
     };
     spans.push(Span::styled(hint, Style::default().fg(DIM)));
+    let hint_w = Line::from(spans.clone()).width() as u16;
+    if with_log
+        && let Some(entry) = app.log.last()
+        && area.width > hint_w + 8
+    {
+        let room = (area.width - hint_w - 2) as usize;
+        let mut text: String = entry.text.chars().take(room).collect();
+        if entry.text.chars().count() > room {
+            text.pop();
+            text.push('…');
+        }
+        let [_, right] = Layout::horizontal([Constraint::Length(hint_w + 2), Constraint::Min(0)]).areas(area);
+        f.render_widget(Paragraph::new(Span::styled(text, log_style(entry))).alignment(Alignment::Right), right);
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 

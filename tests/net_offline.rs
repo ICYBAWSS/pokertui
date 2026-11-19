@@ -381,7 +381,7 @@ async fn bots_keep_playing_after_a_rejoin() {
     host.send(NetCommand::Start);
     wait_for(10.0, "alice dealt in", || a.state().cards.is_some()).await;
     let seat = a.state().seat.unwrap();
-    let hand = a.hand_no();
+    let hand = host.hand_no();
     let id = a.id.clone();
     a.send(NetCommand::Quit);
     wait_for(2.0, "alice gone", || a.state().closed.is_some()).await;
@@ -389,8 +389,38 @@ async fn bots_keep_playing_after_a_rejoin() {
     let a2 = spawn_client(&r, "alice", Some(id), |_| {});
     a2.set_auto(true);
     wait_for(5.0, "alice back", || a2.state().seat == Some(seat)).await;
-    wait_for(40.0, "the hand to finish with bots playing", || {
-        a2.state().view.as_ref().is_some_and(|v| v.hand_no == hand && v.phase == Phase::HandOver)
-    })
-    .await;
+    let t0 = std::time::Instant::now();
+    while t0.elapsed().as_secs() < 15 {
+        if a2.state().view.as_ref().is_some_and(|v| v.hand_no == hand && v.phase == Phase::HandOver) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let st = a2.state();
+    let v = st.view.as_ref().unwrap();
+    let hv = host.state();
+    let hview = hv.view.as_ref().unwrap();
+    panic!(
+        "STALL a2: seat={:?} actor={:?} phase={:?} ver={} errors={:?} | host: actor={:?} phase={:?} ver={} seats={:?}",
+        st.seat, v.actor, v.phase, v.version, st.errors, hview.actor, hview.phase, hview.version,
+        hview.seats.iter().map(|s| (s.name.clone(), s.connected, s.folded, s.sitting_out, s.hole_count)).collect::<Vec<_>>()
+    );
+}
+
+/// Bots never muck: every bot's cards are on show when a hand ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bots_always_show_their_cards() {
+    let r = room(MemoryBus::new(), 4, 2_000);
+    let host = spawn_host(&r, "host", |c| c.bots = vec![Skill::Easy, Skill::Medium, Skill::Hard]);
+    host.set_auto(true);
+    wait_for(5.0, "bots seated", || seated(&host) == 4).await;
+    for n in 1..=3u32 {
+        host.send(NetCommand::Start);
+        wait_for(60.0, "hand over", || host.hand_no() == n && host.phase() == Some(Phase::HandOver)).await;
+        let st = host.state();
+        let v = st.view.as_ref().unwrap();
+        for s in v.seats.iter().filter(|s| s.bot) {
+            assert_eq!(s.reveal.len(), 2, "bot {} mucked", s.name);
+        }
+    }
 }
