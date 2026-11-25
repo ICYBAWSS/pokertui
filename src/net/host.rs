@@ -720,20 +720,6 @@ impl Host {
         {
             let _ = self.tx.send(UiEvent::Info(format!("could not save history: {e}")));
         }
-        if self.cfg.auto_rebuy {
-            let buyin = self.cfg.params.buyin;
-            let mut broke = Vec::new();
-            for (seat, s) in self.table.players_mut() {
-                if s.stack == 0 && s.bot.is_none() {
-                    s.stack = buyin;
-                    s.sitting_out = false;
-                    broke.push(seat);
-                }
-            }
-            if !broke.is_empty() {
-                self.table.note(format!("rebought seat(s) {broke:?} for {buyin}"));
-            }
-        }
         // Bots that went broke get a fresh stack so a practice table keeps going.
         if self.table.params.tourney.is_none() {
             let buyin = self.cfg.params.buyin;
