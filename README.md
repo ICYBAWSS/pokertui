@@ -2,31 +2,13 @@
 
 I just thought this would be a cool and easy way for me and my friends to play poker.
 
-So I made this poker game that runs right in your terminal. One person hosts, everyone else joins using a 12-character room code. That's pretty much it.
+So I made this poker game that runs right in your terminal. One person hosts, everyone else joins using an 8-character room code. That's pretty much it.
 
 There's no setup, no websites, no server to manage u just open up your terminal and play.
 
-## Screenshots
-
-**Menu**
-
-![Main menu](assets/screens/menu.png)
-
-**Lobby**
-
-![Lobby](assets/screens/lobby.png)
-
-**Your turn** — the table border and buttons light up gold and the terminal bell rings
-
-![Your turn](assets/screens/your-turn.png)
-
-**Showdown**
-
-![Showdown](assets/screens/showdown.png)
-
 ## Getting started
 
-**macOS / Linux / Raspberry Pi (64-bit)**
+**macOS / Linux**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.sh | sh
@@ -37,18 +19,11 @@ curl -fsSL https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.sh |
 ```powershell
 irm https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.ps1 | iex
 ```
+- **for temp install (deletes itself after u quit)**
+    - use flag ```-s -- --temp ``` on macOS/Linux
+    - or ```-Temp``` on Windows
 
-**Just trying it? Run it without installing.** Nothing is kept: the game runs from a temporary folder and everything, including your saved name and hand history, is deleted when you quit.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.sh | sh -s -- --temp
-```
-
-On Windows:
-
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/ICYBAWSS/pokertui/main/install.ps1))) -Temp
-```
 
 **Or install directly with Rust:**
 
@@ -134,16 +109,85 @@ alice (host)                                  bob (client)
 ┌───────────────────────────────┐      ┌───────────────────────────────┐
 │ ratatui UI                    │      │ ratatui UI                    │
 │ game::Table                   │      │ client mirror                 │
-│ net::host                     │     
+│ net::host                     │      │ version checking               │
+└───────────────┬───────────────┘      └───────────────┬───────────────┘
+                └─────── MQTT over WebSocket ──────────┘
+```
 
-## Extras
+Each room gets its own set of MQTT topics:
 
-- **Bots:** press `+` as host, or `poker host --bots easy,medium,hard,gto` (GTO plays balanced, mixed-strategy poker).
-- **Sit & Go tournaments:** pick it in the host menu. Blinds rise on a timer, last player wins.
-- **Approve joiners:** `poker host --approve` makes new players wait until you press `y` (accept) or `n` (decline). Players returning to their own seat skip it.
-- **Kick / ban:** as host press `k` (remove) or `K` (ban), then the seat number.
-- **If the host drops,** the next player takes over and the table keeps going. If *you* drop, `poker rejoin` puts you back in your seat.
-- **My stats:** the menu's *My stats* screen shows every number computed from the hands you've played (win rate with its margin of error, how loose and aggressive you play, showdowns), each with its formula, plus a winnings chart, win rate by seat and a starting-hand heat map. Hands are saved to `hands.jsonl` in the data folder, on your machine only.
-- **Fair shuffle:** every player adds randomness to each deal, and every finished hand is replayed and checked by every client.
+```text
+pokertui/v1/<hex>/events
+pokertui/v1/<hex>/snapshot
+pokertui/v1/<hex>/secrets/<player-key>
+```
 
-More in [docs/EXPERIMENTAL_FEATURES.md](docs/EXPERIMENTAL_FEATURES.md).
+The game logic itself is kept separate from the networking and UI. This also made it easier to test things like side pots, odd chips, minimum raises, and heads-up blind order.
+
+There's a 6,250-hand randomized simulation that checks chip conservation after every action, alongside the regular unit tests.
+
+## Public brokers
+
+The game currently supports a few public MQTT brokers:
+
+| Broker | Endpoint |
+|---|---|
+| EMQX (default) | `wss://broker.emqx.io:8084/mqtt` |
+| Mosquitto | `wss://test.mosquitto.org:8081/mqtt` |
+| HiveMQ | `wss://broker.hivemq.com:8884/mqtt` |
+
+One thing to keep in mind: none of these use port 443. Some school, hotel, or corporate networks only allow traffic on 443, so the game might not connect on those networks.
+
+You can also provide your own broker using `--broker`.
+
+## Running from source
+
+```bash
+git clone https://github.com/ICYBAWSS/pokertui.git
+cd pokertui
+cargo build --release
+./target/release/poker
+```
+
+You can also skip the menu and launch a game directly:
+
+```bash
+./target/release/poker host --name alice --blinds 25/50 --buyin 5000
+./target/release/poker join K7Q2-9XZP --name bob
+./target/release/poker spectate K7Q2-9XZP
+```
+
+Hand histories are saved locally:
+
+- macOS: `~/Library/Application Support/dev.pokertui.pokertui/history`
+- Linux: `~/.local/share/pokertui/history`
+
+You can verify or replay a hand using its JSON history file:
+
+```bash
+./target/release/poker verify <history-file>
+./target/release/poker replay <history-file>
+```
+
+## Development
+
+```bash
+cargo test
+cargo test --test net_live -- --ignored --nocapture
+cargo run --example probe
+cargo fmt && cargo clippy --all-targets
+```
+
+## Stuff I'd like to add eventually 
+
+- [ ] More cheating prevention. The host could stack the deck before committing to it.
+- [ ] Host migration / reclaiming seats
+- [ ] Reconnecting as the same player
+- [ ] Host kick / ban
+- [ ] Offline fake-relay integration tests
+- [ ] Optional Cloudflare Durable Objects relay
+- [ ] Mental poker shuffling
+- [ ] Tournaments
+- [ ] Delayed spectating
+- [ ] Bots with configurable skill
+- [ ] Saved rankings of players
